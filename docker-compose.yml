@@ -1,0 +1,58 @@
+version: "3.9"
+
+# Вариант: оба бота собираются из ОДНОГО кода (./erik_bot).
+# Если оставишь второй код в ./sellik_bot и хочешь именно его — см. комментарий внизу (VARIANT B).
+
+services:
+  bot_one:
+    build:
+      context: ./erik_bot
+      dockerfile: Dockerfile
+    container_name: bot_one
+    restart: unless-stopped
+    env_file:
+      - .env.bot_one          # вынеси .env.bot_one в корень (рядом с этим compose)
+    environment:
+      - BOT_INSTANCE_NAME=bot_one
+      - TZ=Asia/Yekaterinburg
+    volumes:
+      - ./data_bot_one:/app/data   # хостовая папка для истории / кешей
+
+    # (Необязательно) healthcheck — раскомментируй при необходимости
+    # healthcheck:
+    #   test: ["CMD-SHELL", "python -c 'print(\"ok\")'"]
+    #   interval: 60s
+    #   timeout: 5s
+    #   retries: 3
+
+  bot_two:
+    build:
+      context: ./erik_bot
+      dockerfile: Dockerfile
+    container_name: bot_two
+    restart: unless-stopped
+    env_file:
+      - .env.bot_two
+    environment:
+      - BOT_INSTANCE_NAME=bot_two
+      - TZ=Asia/Yekaterinburg
+    volumes:
+      - ./data_bot_two:/app/data
+
+    # healthcheck:
+    #   test: ["CMD-SHELL", "python -c 'print(\"ok\")'"]
+    #   interval: 60s
+    #   timeout: 5s
+    #   retries: 3
+
+# Если хочешь использовать именованные volume вместо хост-папок — раскомментируй этот блок
+# и поменяй volumes выше на bot_one_data:/app/data и bot_two_data:/app/data
+# volumes:
+#   bot_one_data:
+#   bot_two_data:
+
+# ===== VARIANT B (если НУЖНО сборку второго из ./sellik_bot) =====
+# Замени у bot_two блок build на:
+#    build:
+#      context: ./sellik_bot
+#      dockerfile: Dockerfile
