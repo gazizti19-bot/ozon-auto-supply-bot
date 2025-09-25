@@ -1,0 +1,100 @@
+2025-09-17T14:03:52.510136118Z Traceback (most recent call last):
+2025-09-17T14:03:52.510314130Z   File "/app/bot.py", line 62, in <module>
+2025-09-17T14:03:52.510599958Z     from supply_integration import setup_supply_handlers
+2025-09-17T14:03:52.510688909Z   File "/app/supply_integration.py", line 107
+2025-09-17T14:03:52.510773261Z     await m.answer(f"Ошибка: {html.escape(str(e)))}")
+2025-09-17T14:03:52.512341720Z                                                     ^
+2025-09-17T14:03:52.512501347Z SyntaxError: f-string: unmatched ')'
+2025-09-17T14:03:55.436119953Z Traceback (most recent call last):
+2025-09-17T14:03:55.436227670Z   File "/app/bot.py", line 62, in <module>
+2025-09-17T14:03:55.436504922Z     from supply_integration import setup_supply_handlers
+2025-09-17T14:03:55.436585727Z   File "/app/supply_integration.py", line 107
+2025-09-17T14:03:55.436669478Z     await m.answer(f"Ошибка: {html.escape(str(e)))}")
+2025-09-17T14:03:55.438259981Z                                                     ^
+2025-09-17T14:03:55.438398326Z SyntaxError: f-string: unmatched ')'
+2025-09-17T14:03:58.473595402Z Traceback (most recent call last):
+2025-09-17T14:03:58.473704641Z   File "/app/bot.py", line 62, in <module>
+2025-09-17T14:03:58.474001010Z     from supply_integration import setup_supply_handlers
+2025-09-17T14:03:58.474087206Z   File "/app/supply_integration.py", line 107
+2025-09-17T14:03:58.474169805Z     await m.answer(f"Ошибка: {html.escape(str(e)))}")
+2025-09-17T14:03:58.475873995Z                                                     ^
+2025-09-17T14:03:58.476049492Z SyntaxError: f-string: unmatched ')'
+2025-09-17T14:04:01.984084772Z Traceback (most recent call last):
+2025-09-17T14:04:01.984248387Z   File "/app/bot.py", line 62, in <module>
+2025-09-17T14:04:01.984675135Z     from supply_integration import setup_supply_handlers
+2025-09-17T14:04:01.984809904Z   File "/app/supply_integration.py", line 107
+2025-09-17T14:04:01.984938231Z     await m.answer(f"Ошибка: {html.escape(str(e)))}")
+2025-09-17T14:04:01.987838676Z                                                     ^
+2025-09-17T14:04:01.988155254Z SyntaxError: f-string: unmatched ')'
+2025-09-17T14:04:05.875023043Z Traceback (most recent call last):
+2025-09-17T14:04:05.875155918Z   File "/app/bot.py", line 62, in <module>
+2025-09-17T14:04:05.875449912Z     from supply_integration import setup_supply_handlers
+2025-09-17T14:04:05.875524275Z   File "/app/supply_integration.py", line 107
+2025-09-17T14:04:05.875619077Z     await m.answer(f"Ошибка: {html.escape(str(e)))}")
+2025-09-17T14:04:05.877280145Z                                                     ^
+2025-09-17T14:04:05.877431645Z SyntaxError: f-string: unmatched ')'
+2025-09-17T14:04:10.392982047Z Traceback (most recent call last):
+2025-09-17T14:04:10.393100435Z   File "/app/bot.py", line 62, in <module>
+2025-09-17T14:04:10.393373128Z     from supply_integration import setup_supply_handlers
+2025-09-17T14:04:10.393451288Z   File "/app/supply_integration.py", line 107
+2025-09-17T14:04:10.393536582Z     await m.answer(f"Ошибка: {html.escape(str(e)))}")
+2025-09-17T14:04:10.395291419Z                                                     ^
+2025-09-17T14:04:10.395433271Z SyntaxError: f-string: unmatched ')'
+2025-09-17T14:04:16.412408791Z Traceback (most recent call last):
+2025-09-17T14:04:16.412517889Z   File "/app/bot.py", line 62, in <module>
+2025-09-17T14:04:16.412813417Z     from supply_integration import setup_supply_handlers
+2025-09-17T14:04:16.412884954Z   File "/app/supply_integration.py", line 107
+2025-09-17T14:04:16.412977301Z     await m.answer(f"Ошибка: {html.escape(str(e)))}")
+2025-09-17T14:04:16.414627027Z                                                     ^
+2025-09-17T14:04:16.414773157Z SyntaxError: f-string: unmatched ')'
+2025-09-17T14:04:25.760706202Z Traceback (most recent call last):
+2025-09-17T14:04:25.760932307Z   File "/app/bot.py", line 62, in <module>
+2025-09-17T14:04:25.761343416Z     from supply_integration import setup_supply_handlers
+2025-09-17T14:04:25.761452605Z   File "/app/supply_integration.py", line 107
+2025-09-17T14:04:25.761566162Z     await m.answer(f"Ошибка: {html.escape(str(e)))}")
+2025-09-17T14:04:25.763546322Z                                                     ^
+2025-09-17T14:04:25.763722239Z SyntaxError: f-string: unmatched ')'
+2025-09-17T14:04:41.687674677Z Traceback (most recent call last):
+2025-09-17T14:04:41.687785640Z   File "/app/bot.py", line 62, in <module>
+2025-09-17T14:04:41.688085295Z     from supply_integration import setup_supply_handlers
+2025-09-17T14:04:41.688160589Z   File "/app/supply_integration.py", line 107
+2025-09-17T14:04:41.688254158Z     await m.answer(f"Ошибка: {html.escape(str(e)))}")
+2025-09-17T14:04:41.693239535Z                                                     ^
+2025-09-17T14:04:41.693426663Z SyntaxError: f-string: unmatched ')'
+2025-09-17T14:05:10.311733416Z Traceback (most recent call last):
+2025-09-17T14:05:10.312102153Z   File "/app/bot.py", line 62, in <module>
+2025-09-17T14:05:10.312535354Z     from supply_integration import setup_supply_handlers
+2025-09-17T14:05:10.312726570Z   File "/app/supply_integration.py", line 107
+2025-09-17T14:05:10.312920153Z     await m.answer(f"Ошибка: {html.escape(str(e)))}")
+2025-09-17T14:05:10.314755052Z                                                     ^
+2025-09-17T14:05:10.315040390Z SyntaxError: f-string: unmatched ')'
+2025-09-17T14:06:04.505647740Z Traceback (most recent call last):
+2025-09-17T14:06:04.506030003Z   File "/app/bot.py", line 62, in <module>
+2025-09-17T14:06:04.506486379Z     from supply_integration import setup_supply_handlers
+2025-09-17T14:06:04.506695470Z   File "/app/supply_integration.py", line 107
+2025-09-17T14:06:04.506915612Z     await m.answer(f"Ошибка: {html.escape(str(e)))}")
+2025-09-17T14:06:04.508647755Z                                                     ^
+2025-09-17T14:06:04.508944022Z SyntaxError: f-string: unmatched ')'
+2025-09-17T14:07:07.489205174Z Traceback (most recent call last):
+2025-09-17T14:07:07.489605191Z   File "/app/bot.py", line 62, in <module>
+2025-09-17T14:07:07.490043221Z     from supply_integration import setup_supply_handlers
+2025-09-17T14:07:07.490338738Z   File "/app/supply_integration.py", line 107
+2025-09-17T14:07:07.490581593Z     await m.answer(f"Ошибка: {html.escape(str(e)))}")
+2025-09-17T14:07:07.492357659Z                                                     ^
+2025-09-17T14:07:07.492621544Z SyntaxError: f-string: unmatched ')'
+2025-09-17T14:08:10.765135640Z Traceback (most recent call last):
+2025-09-17T14:08:10.767773526Z   File "/app/bot.py", line 62, in <module>
+2025-09-17T14:08:10.768509116Z     from supply_integration import setup_supply_handlers
+2025-09-17T14:08:10.769020216Z   File "/app/supply_integration.py", line 107
+2025-09-17T14:08:10.769491359Z     await m.answer(f"Ошибка: {html.escape(str(e)))}")
+2025-09-17T14:08:10.772283772Z                                                     ^
+2025-09-17T14:08:10.776216712Z SyntaxError: f-string: unmatched ')'
+[Kbot_erik exited with code 1
+2025-09-17T14:09:13.834595082Z Traceback (most recent call last):
+2025-09-17T14:09:13.835628813Z   File "/app/bot.py", line 62, in <module>
+2025-09-17T14:09:13.836329535Z     from supply_integration import setup_supply_handlers
+2025-09-17T14:09:13.836722318Z   File "/app/supply_integration.py", line 107
+2025-09-17T14:09:13.837140320Z     await m.answer(f"Ошибка: {html.escape(str(e)))}")
+2025-09-17T14:09:13.839109474Z                                                     ^
+2025-09-17T14:09:13.839579785Z SyntaxError: f-string: unmatched ')'
+[Kbot_erik exited with code 1
