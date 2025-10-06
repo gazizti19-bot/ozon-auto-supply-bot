@@ -3,14 +3,22 @@
 """
 Ozon FBO Telegram Bot + GigaChat + Auto-supplies
 
-- Полный рабочий bot.py с интеграцией автопоставок.
-- Исправление: универсальный текстовый хендлер НЕ перехватывает команды (без SkipHandler).
-- Интеграция автопоставок через supply_integration.setup_supply_handlers(bot, dp, scheduler).
-
 VERSION: stable-grounded-1.3.3-cluster-pretty
-"""
 
+Что изменено относительно вашей базовой версии:
+- Добавлены notify-обёртки для авто-заявок (текст и PDF).
+- Единичная регистрация фоновой джобы авто-заявок через supply_watch.register_supply_scheduler (без дублей).
+- Мягкая очистка возможных дубликатов джобы из setup_supply_handlers (если модуль её создаёт сам).
+- Опечатки с EMOJI_* устранены (используются только латинские символы в идентификаторах).
+- В остальном старый функционал сохранён.
+
+Примечание:
+Чтобы починить залипание задач на тайм-слоте (404/429), у вас должен быть обновлённый supply_watch.py
+с трактовкой «только 404/429» как not_supported_404. Если вы используете мой файл supply_watch.py
+из предыдущего ответа — просто оставьте его рядом.
+"""
 import os
+os.environ["AUTO_BOOK"] = "0"  # гарантия: timeslot-патч не будет сам бронировать
 import asyncio
 import logging
 import json
@@ -35,7 +43,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
     Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton,
-    InlineKeyboardMarkup, InlineKeyboardButton
+    InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
 )
 from aiogram.filters import Command
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -45,6 +53,12 @@ from aiogram.exceptions import TelegramRetryAfter
 
 # ======= AUTO-SUPPLY INTEGRATION =======
 import supply_integration as si
+from supply_watch import register_supply_scheduler
+# (опц.) Если в будущем захотите управлять задачами из бота:
+try:
+    from supply_watch import purge_tasks, purge_all_tasks, purge_stale_nonfinal  # noqa: F401
+except Exception:
+    purge_tasks = purge_all_tasks = purge_stale_nonfinal = None
 # ======================================
 
 # ================== Version ==================
@@ -68,6 +82,7 @@ MAX_HISTORY_SNAPSHOTS = int(os.getenv("MAX_HISTORY_SNAPSHOTS", "5000"))
 SNAPSHOT_INTERVAL_MINUTES = int(os.getenv("SNAPSHOT_INTERVAL_MINUTES", "30"))
 SNAPSHOT_STALE_MINUTES = int(os.getenv("SNAPSHOT_STALE_MINUTES", "15"))
 SNAPSHOT_MIN_REUSE_SECONDS = int(os.getenv("SNAPSHOT_MIN_REUSE_SECONDS", "120"))
+HISTORY_PRUNE_EVERY_MINUTES = int(os.getenv("HISTORY_PRUNE_EVERY_MINUTES", "360"))
 
 DAILY_NOTIFY_HOUR = int(os.getenv("DAILY_NOTIFY_HOUR", "9"))
 DAILY_NOTIFY_MINUTE = int(os.getenv("DAILY_NOTIFY_MINUTE", "0"))
@@ -76,7 +91,6 @@ TZ_NAME = os.getenv("TZ", "UTC")
 API_TIMEOUT_SECONDS = int(os.getenv("API_TIMEOUT_SECONDS", "15"))
 HEALTH_WARN_LATENCY_MS = int(os.getenv("HEALTH_WARN_LATENCY_MS", "4000"))
 SAVE_BUFFER_FLUSH_SECONDS = int(os.getenv("SAVE_BUFFER_FLUSH_SECONDS", "30"))
-HISTORY_PRUNE_EVERY_MINUTES = int(os.getenv("HISTORY_PRUNE_EVERY_MINUTES", "360"))
 
 DEFAULT_VIEW_MODE = "FULL"
 
@@ -121,6 +135,9 @@ WAREHOUSE_CLUSTERS_ENV = os.getenv("WAREHOUSE_CLUSTERS", "").strip()
 
 STOCK_PAGE_SIZE = min(25, max(5, int(os.getenv("STOCK_PAGE_SIZE", "40"))))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+
+# Интервал фоновой джобы supply_watch (секунды)
+SUPPLY_JOB_INTERVAL = int(os.getenv("SUPPLY_JOB_INTERVAL", "45"))
 
 # ================== Logging ==================
 logging.basicConfig(
@@ -790,7 +807,7 @@ def fancy_ratio_bar(parts: List[Tuple[int,str]], total: int, length: int = 24) -
         return EMPTY_SEG * length
     raw = []
     for count, color in parts:
-        frac = count / total
+        frac = count / total if total > 0 else 0.0
         raw_blocks = frac * length
         raw.append((color, raw_blocks))
     allocated = []
@@ -1366,6 +1383,18 @@ async def send_long(chat_id:int, text:str, kb:Optional[InlineKeyboardMarkup]=Non
                                 disable_web_page_preview=True,
                                 reply_markup=kb if (kb and i==len(parts)-1) else None)
         await asyncio.sleep(0.02)
+
+# ======= Supply-watch notify wrappers (для PDF/сообщений) =======
+async def supply_notify_text(chat_id: int, text: str):
+    await send_safe_message(chat_id, text, parse_mode="HTML", disable_web_page_preview=True)
+
+async def supply_notify_file(chat_id: int, file_path: str, caption: str = ""):
+    try:
+        doc = FSInputFile(file_path)
+        await bot.send_document(chat_id, document=doc, caption=caption)
+    except Exception as e:
+        log.warning("send_document fail: %s", e)
+        await send_safe_message(chat_id, f"Не удалось отправить файл: {html.escape(str(e))}\n{caption}")
 
 # ================== Analyze ==================
 async def handle_analyze(chat_id:int, verbose:bool=True):
@@ -1989,6 +2018,29 @@ async def cmd_ai_auto_ca(m: Message):
         return
     await m.answer(f"CA bundle обновлён. Сертификатов: {bundle.count('BEGIN CERTIFICATE')}.")
 
+# (опц.) Хелперы управления задачами (если supply_watch предоставляет функции)
+@dp.message(Command("supply_purge_all"))
+async def cmd_supply_purge_all(m: Message):
+    ensure_admin(m.from_user.id)
+    if not purge_all_tasks:
+        await m.answer("Функция недоступна в этой сборке.")
+        return
+    cnt = purge_all_tasks()
+    await m.answer(f"Удалено задач: {cnt}")
+
+@dp.message(Command("supply_purge_stale"))
+async def cmd_supply_purge_stale(m: Message):
+    ensure_admin(m.from_user.id)
+    if not purge_stale_nonfinal:
+        await m.answer("Функция недоступна в этой сборке.")
+        return
+    try:
+        hours = int(m.text.strip().split(maxsplit=1)[1])
+    except Exception:
+        hours = 48
+    cnt = purge_stale_nonfinal(hours=hours)
+    await m.answer(f"Удалено зависших не финальных задач за >{hours}ч: {cnt}")
+
 # ================== FSM Chat ==================
 @dp.message(F.text == "🤖 AI чат")
 async def btn_ai_chat(m: Message, state: FSMContext):
@@ -2119,7 +2171,33 @@ async def init_snapshot():
 
 def log_jobs(sched: AsyncIOScheduler):
     for job in sched.get_jobs():
-        log.info("Job %s next=%s", job.id, job.next_run_time)
+        try:
+            fn = getattr(job, "func", None)
+            fn_name = getattr(fn, "__qualname__", str(fn))
+        except Exception:
+            fn_name = "<?>"
+        log.info("Job id=%s next=%s func=%s", job.id, job.next_run_time, fn_name)
+
+def _cleanup_duplicate_supply_jobs(scheduler: AsyncIOScheduler):
+    """
+    Если setup_supply_handlers зарегистрировал свою интервал-добу process_tasks,
+    пытаемся убрать дубликат, оставив только register_supply_scheduler.
+    """
+    removed = 0
+    for job in list(scheduler.get_jobs()):
+        try:
+            fn = getattr(job, "func", None)
+            qn = getattr(fn, "__qualname__", "") or ""
+            mod = getattr(fn, "__module__", "") or ""
+            # эвристика: локальная функция из setup_supply_handlers
+            if "setup_supply_handlers" in qn or "supply_integration" in mod and "process_tasks" in qn:
+                scheduler.remove_job(job.id)
+                removed += 1
+                log.info("Removed duplicate supply process job id=%s qn=%s", job.id, qn)
+        except Exception as e:
+            log.debug("job scan error: %s", e)
+    if removed:
+        log.info("Duplicate supply jobs removed: %d", removed)
 
 # ================== Signals ==================
 def _install_signals(loop: asyncio.AbstractEventLoop):
@@ -2152,8 +2230,21 @@ async def main():
     scheduler.start()
 
     # ======= AUTO-SUPPLY INTEGRATION =======
+    # Регистрируем хендлеры и служебные команды автопоставок
     si.setup_supply_handlers(bot, dp, scheduler)
     log.info("Auto-supply handlers registered.")
+
+    # Попробуем убрать возможные дубли планировщика, созданные внутри setup_supply_handlers
+    _cleanup_duplicate_supply_jobs(scheduler)
+
+    # Регистрируем фоновую джобу supply_watch РОВНО один раз (без дублей)
+    register_supply_scheduler(
+        scheduler,
+        notify_text=supply_notify_text,
+        notify_file=supply_notify_file,
+        interval_seconds=SUPPLY_JOB_INTERVAL,
+    )
+    log.info("Supply-watch scheduler registered (interval=%ss).", SUPPLY_JOB_INTERVAL)
     # ======================================
 
     log_jobs(scheduler)

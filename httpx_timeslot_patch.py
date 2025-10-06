@@ -21,6 +21,20 @@ except Exception:
 logger = logging.getLogger("httpx_timeslot_patch")
 logger.setLevel(logging.INFO)
 
+# === helpers for ENV ===
+def _get_bool_env(*names: str, default: bool = False) -> bool:
+    """
+    Возвращает bool по первому найденному имени переменной окружения из списка.
+    Значения "1,true,yes,y,on" (без учета регистра) считаются True.
+    Если ни одна переменная не задана — вернёт default.
+    """
+    for name in names:
+        v = os.getenv(name)
+        if v is not None and v != "":
+            s = str(v).strip().lower()
+            return s in ("1", "true", "yes", "y", "on")
+    return bool(default)
+
 # === ENV ===
 DROP_ID = int(os.getenv("OZON_DROP_OFF_ID", "0") or "0")
 DROP_TZ = os.getenv("OZON_DROP_OFF_TZ", os.getenv("OZON_TZ", "Asia/Yekaterinburg"))
@@ -36,7 +50,9 @@ FBO_LIST_SUPPLY_TYPES: List[str] = [
 STUB_FBO_LIST = os.getenv("OZON_STUB_FBO_LIST", "1").lower() in ("1", "true", "yes", "y")
 USE_CLUSTER_WIDS = os.getenv("OZON_USE_CLUSTER_WIDS", "1").lower() in ("1", "true", "yes", "y")
 
-AUTO_BOOK = os.getenv("OZON_AUTO_BOOK", "1").lower() in ("1", "true", "yes", "y")
+# ВАЖНО: читаем оба ключа, приоритет у AUTO_BOOK. По умолчанию ВЫКЛЮЧЕНО.
+AUTO_BOOK = _get_bool_env("AUTO_BOOK", "OZON_AUTO_BOOK", default=False)
+
 REQUIRE_SUPPLY_ID = os.getenv("REQUIRE_SUPPLY_ID", "0").lower() in ("1", "true", "yes", "y")
 PROGRESS_TASK_ON_BOOK = os.getenv("PROGRESS_TASK_ON_BOOK", "1").lower() in ("1", "true", "yes", "y")
 
@@ -1249,7 +1265,7 @@ def _install_sync_post_patch():
                         logger.warning("auto-book(sync) error: %s", e)
 
                     drop_item, _ = _find_drop_item(mod, DROP_ID)
-                    if drop_item is None and DISCOVER_DROPOFFS:
+                    if drop_item is None and DISCOVER_DROПОFFS:
                         discover_js = deepcopy(js)
                         discover_js.pop("drop_off_warehouse_id", None)
                         logger.warning("timeslot discover: retry without drop_off to list available drop-offs")
@@ -1363,7 +1379,7 @@ def _install_async_post_patch():
                         logger.warning("auto-book(async) error: %s", e)
 
                     drop_item, _ = _find_drop_item(mod, DROP_ID)
-                    if drop_item is None and DISCOVER_DROPOFFS:
+                    if drop_item is None and DISCOVER_DROПОFFS:
                         discover_js = deepcopy(js)
                         discover_js.pop("drop_off_warehouse_id", None)
                         logger.warning("timeslot discover(async): retry without drop_off to list available drop-offs")
