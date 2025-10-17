@@ -50,6 +50,9 @@ FBO_LIST_SUPPLY_TYPES: List[str] = [
 STUB_FBO_LIST = os.getenv("OZON_STUB_FBO_LIST", "1").lower() in ("1", "true", "yes", "y")
 USE_CLUSTER_WIDS = os.getenv("OZON_USE_CLUSTER_WIDS", "1").lower() in ("1", "true", "yes", "y")
 
+# Управление fallback-логикой timeslot: ретраи на другие WID и discover-запросы без drop_off
+DISABLE_TS_FALLBACK = os.getenv("OZON_TIMESLOT_DISABLE_FALLBACK", "1").lower() in ("1", "true", "yes", "y")
+
 # ВАЖНО: читаем оба ключа, приоритет у AUTO_BOOK. По умолчанию ВЫКЛЮЧЕНО.
 AUTO_BOOK = _get_bool_env("AUTO_BOOK", "OZON_AUTO_BOOK", default=False)
 
@@ -119,7 +122,7 @@ def _extract_cluster_and_primary(resp_json: Dict[str, Any]) -> Tuple[List[int], 
     except Exception as e:
         logger.warning("create/info parse error: %s", e)
     seen = set()
-    uniq = []
+    uniq: List[int] = []
     for wid in out:
         if wid not in seen:
             uniq.append(wid)
@@ -191,7 +194,7 @@ def _reorder_or_filter_to_drop_only(resp_json: Dict[str, Any]) -> Dict[str, Any]
     if not isinstance(arr, list) or not arr:
         return resp_json
     drop_item = None
-    others = []
+    others: List[Dict[str, Any]] = []
     for it in arr:
         try:
             if int(it.get("drop_off_warehouse_id")) == int(DROP_ID):
@@ -259,7 +262,7 @@ def _normalize_warehouse_ids_with_cluster(js: Dict[str, Any]) -> Tuple[Dict[str,
 
     js2 = deepcopy(js)
     req_ids = js2.get("warehouse_ids") or []
-    norm_req = []
+    norm_req: List[int] = []
     for x in req_ids:
         try:
             norm_req.append(int(x))
@@ -282,8 +285,10 @@ def _normalize_warehouse_ids_with_cluster(js: Dict[str, Any]) -> Tuple[Dict[str,
         return js2, False
 
     js2["warehouse_ids"] = list(cluster_set)
-    logger.warning("timeslot/info: warehouse_ids %s not in cluster %s -> replace with cluster",
-                   norm_req, list(cluster_set))
+    logger.warning(
+        "timeslot/info: warehouse_ids %s not in cluster %s -> replace with cluster",
+        norm_req, list(cluster_set)
+    )
     return js2, True
 
 
@@ -310,7 +315,7 @@ def _make_fbo_stub_payload() -> Dict[str, Any]:
 def _choose_supply_wid(req_js: Dict[str, Any], draft_id: Optional[int], override: Optional[int] = None) -> Optional[int]:
     if override:
         return int(override)
-    ids = []
+    ids: List[int] = []
     for x in (req_js.get("warehouse_ids") or []):
         try:
             ids.append(int(x))
@@ -368,7 +373,7 @@ def _target_from_sw_by_draft(draft_id: Optional[int]) -> Tuple[Optional[str], Op
             try:
                 if int(t.get("draft_id")) == int(draft_id):
                     f = t.get("desired_from_iso") or t.get("desired_from_in_timezone") or t.get("from_in_timezone")
-                    g = t.get("desired_to_iso")   or t.get("desired_to_in_timezone")   or t.get("to_in_timezone")
+                    g = t.get("desired_to_iso") or t.get("desired_to_in_timezone") or t.get("to_in_timezone")
                     if f and g:
                         return str(f), str(g)
             except Exception:
@@ -482,7 +487,7 @@ def _supply_create_payload_variants(draft_id: int, supply_wid: int, f: str, t: s
         "fromInTimezone": f,
         "toInTimezone": t,
     })
-    out = []
+    out: List[Dict[str, Any]] = []
     for payload in v:
         payload2 = {k: v for k, v in payload.items() if v is not None}
         out.append(payload2)
@@ -1180,7 +1185,10 @@ def _install_sync_post_patch():
             if url.endswith("/v1/warehouse/fbo/list"):
                 if STUB_FBO_LIST:
                     data = _make_fbo_stub_payload()
-                    logger.info("stub /v1/warehouse/fbo/list -> synthetic 200 with warehouses=%s", len(data.get("warehouses", [])))
+                    logger.info(
+                        "stub /v1/warehouse/fbo/list -> synthetic 200 with warehouses=%s",
+                        len(data.get("warehouses", []))
+                    )
                     return _synthetic_json_response(url, 200, data)
                 js = kwargs.get("json") or {}
                 js = _patch_fbo_list_payload(js)
@@ -1241,7 +1249,7 @@ def _install_sync_post_patch():
                     override_wid: Optional[int] = None
 
                     di, days_cnt = _find_drop_item(data, DROP_ID)
-                    if di is None or days_cnt == 0:
+                    if (not DISABLE_TS_FALLBACK) and (di is None or days_cnt == 0):
                         draft_id = None
                         try:
                             draft_id = int(js.get("draft_id")) if js.get("draft_id") is not None else None
@@ -1260,12 +1268,13 @@ def _install_sync_post_patch():
                         resp = _apply_mod_and_rebuild_response(resp, mod)
 
                     try:
-                        _maybe_autobook_supply_sync(self, url, js, mod, headers=kwargs.get("headers"), override_wid=override_wid)
+                        if not DISABLE_TS_FALLBACK:
+                            _maybe_autobook_supply_sync(self, url, js, mod, headers=kwargs.get("headers"), override_wid=override_wid)
                     except Exception as e:
                         logger.warning("auto-book(sync) error: %s", e)
 
                     drop_item, _ = _find_drop_item(mod, DROP_ID)
-                    if drop_item is None and DISCOVER_DROПОFFS:
+                    if (not DISABLE_TS_FALLBACK) and drop_item is None and DISCOVER_DROPOFFS:
                         discover_js = deepcopy(js)
                         discover_js.pop("drop_off_warehouse_id", None)
                         logger.warning("timeslot discover: retry without drop_off to list available drop-offs")
@@ -1294,7 +1303,10 @@ def _install_async_post_patch():
             if url.endswith("/v1/warehouse/fbo/list"):
                 if STUB_FBO_LIST:
                     data = _make_fbo_stub_payload()
-                    logger.info("stub /v1/warehouse/fbo/list(async) -> synthetic 200 with warehouses=%s", len(data.get("warehouses", [])))
+                    logger.info(
+                        "stub /v1/warehouse/fbo/list(async) -> synthetic 200 with warehouses=%s",
+                        len(data.get("warehouses", []))
+                    )
                     return _synthetic_json_response(url, 200, data)
                 js = kwargs.get("json") or {}
                 js = _patch_fbo_list_payload(js)
@@ -1355,7 +1367,7 @@ def _install_async_post_patch():
                     override_wid: Optional[int] = None
 
                     di, days_cnt = _find_drop_item(data, DROP_ID)
-                    if di is None or days_cnt == 0:
+                    if (not DISABLE_TS_FALLBACK) and (di is None or days_cnt == 0):
                         draft_id = None
                         try:
                             draft_id = int(js.get("draft_id")) if js.get("draft_id") is not None else None
@@ -1374,12 +1386,13 @@ def _install_async_post_patch():
                         resp = _apply_mod_and_rebuild_response(resp, mod)
 
                     try:
-                        await _maybe_autobook_supply_async(self, url, js, mod, headers=kwargs.get("headers"), override_wid=override_wid)
+                        if not DISABLE_TS_FALLBACK:
+                            await _maybe_autobook_supply_async(self, url, js, mod, headers=kwargs.get("headers"), override_wid=override_wid)
                     except Exception as e:
                         logger.warning("auto-book(async) error: %s", e)
 
                     drop_item, _ = _find_drop_item(mod, DROP_ID)
-                    if drop_item is None and DISCOVER_DROПОFFS:
+                    if (not DISABLE_TS_FALLBACK) and drop_item is None and DISCOVER_DROPOFFS:
                         discover_js = deepcopy(js)
                         discover_js.pop("drop_off_warehouse_id", None)
                         logger.warning("timeslot discover(async): retry without drop_off to list available drop-offs")
@@ -1407,7 +1420,7 @@ def install():
     _install_sync_post_patch()
     _install_async_post_patch()
     logger.info(
-        "httpx_timeslot_patch: installed (DROP_TZ=%s, DAYS=%s, DROP_ID=%s, STRICT_DROP_ONLY=%s, FBO_FILTER=%s, STUB_FBO_LIST=%s, USE_CLUSTER_WIDS=%s, AUTO_BOOK=%s)",
+        "httpx_timeslot_patch: installed (DROP_TZ=%s, DAYS=%s, DROP_ID=%s, STRICT_DROP_ONLY=%s, FBO_FILTER=%s, STUB_FBO_LIST=%s, USE_CLUSTER_WIDS=%s, DISCOVER_DROPOFFS=%s, DISABLE_TS_FALLBACK=%s, AUTO_BOOK=%s)",
         DROP_TZ,
         SLOT_SEARCH_DAYS,
         DROP_ID,
@@ -1415,6 +1428,8 @@ def install():
         FBO_LIST_SUPPLY_TYPES,
         STUB_FBO_LIST,
         USE_CLUSTER_WIDS,
+        DISCOVER_DROPOFFS,
+        DISABLE_TS_FALLBACK,
         AUTO_BOOK,
     )
 

@@ -1451,7 +1451,8 @@ async def _auto_fill_timeslot_if_needed(task: Dict[str, Any], api: OzonApi, meta
         task["order_timeslot_set_note"] = "timeslot API not available; relying on supply create"
         if task.get("order_id") and not task.get("supply_id"):
             task["supply_id"] = str(task["order_id"])
-        task["status"] = ST_CARGO_PREП if AUTO_CREATE_CARGOES else ST_DONE
+        # FIX: корректный статус константы
+        task["status"] = ST_CARGO_PREP if AUTO_CREATE_CARGOES else ST_DONE
         task["retry_after_ts"] = 0
         task["retry_after_jitter"] = 0.0
         task["next_attempt_ts"] = now_ts()
@@ -2243,7 +2244,8 @@ async def advance_task(task: Dict[str, Any], api: OzonApi, notify_text, notify_f
 
             if not ok:
                 task["op_retries"] = int(task.get("op_retries") or 0) + 1
-                if task["оп_retries"] > max(SUPPLY_MAX_OPERATION_RETRIES, ORDER_FILL_MAX_RETRIES):
+                # FIX: корректное поле счётчика попыток
+                if task["op_retries"] > max(SUPPLY_MAX_OPERATION_RETRIES, ORDER_FILL_MAX_RETRIES):
                     task["status"] = ST_FAILED
                     task["last_error"] = str(err)
                     update_task(task)
@@ -2365,7 +2367,8 @@ async def advance_task(task: Dict[str, Any], api: OzonApi, notify_text, notify_f
 
             task["cargo_operation_id"] = op_id
             task["op_started_ts"] = now_ts()
-            task["оп_retries"] = 0
+            # FIX: корректное поле счётчика попыток
+            task["op_retries"] = 0
             task["status"] = ST_POLL_CARGO
             update_task(task)
             schedule(OPERATION_POLL_INTERVAL_SECONDS)
