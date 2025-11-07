@@ -3,16 +3,28 @@
 httpx_rate_limit_patch
 Анти-429 патч для httpx с «лёгкими» дефолтами и жёстким ограничением внутренних ожиданий.
 
-Основные изменения (по сравнению с прежней версией):
-- По умолчанию отключён create-gate (RL_DISABLE_CREATE_GATE=1).
-- Любые внутренние ожидания (preflight, limiter, create-gate, avoid-second) каппируются
-  RL_MAX_SLEEP_SEC (по умолчанию 1.0s).
-- create-gate, если включён, дополнительно ограничен RL_MAX_CREATE_WAIT_MS (по умолчанию 750ms).
-- Снижены дефолты: ALIGN=False, CREATE_GAP=0, ON429 blacklist TTL=5s, per_second_cooldown=0.5s,
-  avoid_create_second_for_others=False, cold-start stagger=0.
-- На 429: penalize сохраняется, но Retry-After ограничивается RL_MAX_RETRY_AFTER_SEC (по умолчанию 6s).
+Что делает:
+- Каппирует любые внутренние ожидания (preflight, limiter, create-gate, avoid-second) RL_MAX_SLEEP_SEC (по умолчанию 1.0s).
+- На 429 использует Retry-After, но с потолком RL_MAX_RETRY_AFTER_SEC (по умолчанию 6s) и выставляет пенальти у хоста.
+- Поддерживает «create-gate» (межпроцессно синхронизированный слот) для эндпоинтов создания.
+- «Секунду создателя» можно защищать от параллельных не-create запросов (опционально).
+- По умолчанию поведение лёгкое: create-gate выключен, задержки минимальны.
 
-Можно вернуть прежнюю «тяжёлую» модель через ENV (см. переменные ниже).
+Актуализации под наш флоу:
+- В список «создающих» (CREATE_ENDPOINTS) добавлен /v1/cargoes/create и /v1/cargoes-label/create,
+  чтобы эти вызовы могли использовать общий create-gate (если он включён).
+- Опционально можно расширить список через ENV: OZON_EXTRA_CREATE_ENDPOINTS="/v1/foo,/v1/bar".
+- Не включаем create-gate по умолчанию (RL_DISABLE_CREATE_GATE=True), чтобы не тормозить пайплайн.
+  Интервалы между попытками cargoes/create остаются на уровне оркестратора (supply_watch), как и обсуждалось.
+
+ENV ключи (важные):
+- RL_DISABLE_CREATE_GATE (default: 1/True) — выключить межпроцессной create-gate.
+- RL_MAX_SLEEP_SEC (default: 1.0) — кап на любые ожидания внутри патча.
+- RL_MAX_CREATE_WAIT_MS (default: 750) — максимум для create-gate ожидания.
+- RL_MAX_RETRY_AFTER_SEC (default: 6.0) — кап для Retry-After/пенальти.
+- OZON_RPM (default: 8), OZON_BURST (default: 1) — базовые лимиты в секунду/окно.
+- OZON_PER_SECOND_COOLDOWN_SEC (default: 0.5) — базовая прослойка между запросами.
+- AVOID_CREATE_SECOND_FOR_OTHERS (default: False) — избегать «секунды создателя» для прочих запросов.
 """
 from __future__ import annotations
 
@@ -111,7 +123,14 @@ RL_MAX_RETRY_AFTER_SEC = max(0, _getenv_float("RL_MAX_RETRY_AFTER_SEC", 6.0))
 CREATE_ENDPOINTS: Set[str] = {
     "/v1/draft/create",
     "/v1/draft/supply/create",
+    "/v1/cargoes/create",
+    "/v1/cargoes-label/create",
 }
+
+# Расширяемый список create-эндпоинтов из ENV (через запятую)
+_extra_create = [s.strip() for s in _getenv_str("OZON_EXTRA_CREATE_ENDPOINTS", "").split(",") if s.strip()]
+if _extra_create:
+    CREATE_ENDPOINTS |= set(_extra_create)
 
 # ================== УТИЛИТЫ ==================
 
@@ -333,7 +352,7 @@ class _CrossProcCreateGate:
         if fcntl is None:
             # Без межпроцессной блокировки — лишь минимальная пауза, с капом
             now = time.time()
-            wait_gap = max(0.0, (0.0 + gap) - now)  # практического смысла тут мало; делаем no-op
+            wait_gap = max(0.0, (0.0 + gap) - now)  # no-op по существу
             capped = _clamped_sleep_seconds(wait_gap)
             if capped > 0:
                 time.sleep(capped)
@@ -467,7 +486,6 @@ class _HostLimiter:
         self._penalty_until = max(self._penalty_until, time.time() + seconds)
 
 _host_limiters: Dict[str, _HostLimiter] = {}
-_first_create_done_flag = False
 
 def _get_limiter_for_host(host: str) -> _HostLimiter:
     if host not in _host_limiters:
@@ -498,8 +516,11 @@ async def _avoid_create_second_for_non_create(path: str):
             )
             await asyncio.sleep(capped)
 
-async def _prefight_throttle(host: str, path: str):
+async def _preflight_throttle(host: str, path: str):
+    # Защита «секунды создателя» (опционально)
     await _avoid_create_second_for_non_create(path)
+
+    # Тонкая подстройка начала секунды (опционально)
     if ALIGN_SECOND_BOUNDARY:
         now = time.time()
         frac = now - int(now)
@@ -507,22 +528,25 @@ async def _prefight_throttle(host: str, path: str):
             capped = _clamped_sleep_seconds(0.02 - frac)
             if capped > 0:
                 await asyncio.sleep(capped)
+
+    # Небольшой джиттер (опционально)
     if JITTER_MS > 0:
         capped = _clamped_sleep_seconds(JITTER_MS / 1000.0)
         if capped > 0:
             await asyncio.sleep(capped)
 
+    # Общий лимитер по хосту (burst+rpm)
     lim = _get_limiter_for_host(host)
     await lim.acquire()
 
+    # Межпроцессное окно для create (если включено)
     if path in CREATE_ENDPOINTS and not RL_DISABLE_CREATE_GATE:
-        global _first_create_done_flag
-        if not _first_create_done_flag and CREATE_COLD_START_STAGGER_SEC > 0:
+        if CREATE_COLD_START_STAGGER_SEC > 0 and not _CrossProcCreateGate._first_create_done:
             delay = random.uniform(0, float(CREATE_COLD_START_STAGGER_SEC))
             capped = _clamped_sleep_seconds(delay)
             if capped > 0:
                 await asyncio.sleep(capped)
-            _first_create_done_flag = True
+            _CrossProcCreateGate._first_create_done = True
         await _CrossProcCreateGate.wait("CREATE", CREATE_GAP)
 
 # ================== ПАТЧИРОВАННЫЕ ЗАПРОСЫ ==================
@@ -535,7 +559,7 @@ async def _patched_async_request(self: httpx.AsyncClient, method: str, url, *arg
     host = _host_of(url_str)
     path = _path_of(url_str)
     if _is_tracked_domain(host):
-        await _prefight_throttle(host, path)
+        await _preflight_throttle(host, path)
 
     resp = await _orig_async_request(self, method, url, *args, **kwargs)
 
@@ -584,7 +608,7 @@ def _patched_sync_request(self: httpx.Client, method: str, url, *args, **kwargs)
                     lim._deque.popleft()
         lim._deque.append(time.time())
 
-        # Прочие префлайты
+        # Прочие префлайты (опциональные)
         if ALIGN_SECOND_BOUNDARY:
             frac = time.time() - int(time.time())
             if frac < 0.02:
@@ -634,12 +658,14 @@ def configure(
     max_create_wait_ms: Optional[int] = None,
     max_sleep_sec: Optional[float] = None,
     max_retry_after_sec: Optional[float] = None,
+    extra_create_endpoints: Optional[List[str]] = None,
 ) -> None:
     """Опциональная конфигурация во время рантайма."""
     global RPM, BURST, PER_SECOND_COOLDOWN, CREATE_GAP, ALIGN_SECOND_BOUNDARY
     global ON429_SKIP_MINUTES, ON429_BLACKLIST_TTL_SEC, FORCE_ROTATE_ON429
     global AVOID_CREATE_SECOND_FOR_OTHERS, AVOID_MARGIN_MS
     global RL_DISABLE_CREATE_GATE, RL_MAX_CREATE_WAIT_MS, RL_MAX_SLEEP_SEC, RL_MAX_RETRY_AFTER_SEC
+    global CREATE_ENDPOINTS
 
     if rpm is not None:
         RPM = int(rpm)
@@ -669,6 +695,8 @@ def configure(
         RL_MAX_SLEEP_SEC = max(0.0, float(max_sleep_sec))
     if max_retry_after_sec is not None:
         RL_MAX_RETRY_AFTER_SEC = max(0.0, float(max_retry_after_sec))
+    if extra_create_endpoints:
+        CREATE_ENDPOINTS |= set(extra_create_endpoints)
 
 def install():
     if getattr(install, "_installed", False):
@@ -680,10 +708,12 @@ def install():
         "httpx_rate_limit_patch: installed (rpm=%d, burst=%d, per_second_cooldown=%.1fs, create_gap=%.1fs, "
         "slot=%s, slot_offset_ms=%d, cold_start_stagger=%ds, jitter=%dms, align=%s, "
         "on429_skip_minutes=%d, bl_ttl=%ds, force_rotate_on429=%s, avoid_create_second_for_others=%s, avoid_margin_ms=%d, "
-        "disable_create_gate=%s, max_create_wait_ms=%d, max_sleep_sec=%.2f, max_retry_after_sec=%.2f)",
+        "disable_create_gate=%s, max_create_wait_ms=%d, max_sleep_sec=%.2f, max_retry_after_sec=%.2f, "
+        "create_endpoints=%s)",
         RPM, BURST, PER_SECOND_COOLDOWN, CREATE_GAP,
         (CREATE_SLOT_ENV if CREATE_SLOT_ENV != "" else "auto"),
         CREATE_SLOT_OFFSET_MS, CREATE_COLD_START_STAGGER_SEC, JITTER_MS, str(ALIGN_SECOND_BOUNDARY),
         ON429_SKIP_MINUTES, ON429_BLACKLIST_TTL_SEC, str(FORCE_ROTATE_ON429), str(AVOID_CREATE_SECOND_FOR_OTHERS), AVOID_MARGIN_MS,
-        str(RL_DISABLE_CREATE_GATE), RL_MAX_CREATE_WAIT_MS, RL_MAX_SLEEP_SEC, RL_MAX_RETRY_AFTER_SEC
+        str(RL_DISABLE_CREATE_GATE), RL_MAX_CREATE_WAIT_MS, RL_MAX_SLEEP_SEC, RL_MAX_RETRY_AFTER_SEC,
+        sorted(CREATE_ENDPOINTS),
     )

@@ -39,25 +39,30 @@ def _get_bool_env(*names: str, default: bool = False) -> bool:
 DROP_ID = int(os.getenv("OZON_DROP_OFF_ID", "0") or "0")
 DROP_TZ = os.getenv("OZON_DROP_OFF_TZ", os.getenv("OZON_TZ", "Asia/Yekaterinburg"))
 SLOT_SEARCH_DAYS = int(os.getenv("SLOT_SEARCH_DAYS", "7") or "7")
-STRICT_DROP_ONLY = os.getenv("SLOT_STRICT_DROP_ONLY", "true").lower() in ("1", "true", "yes", "y")
 
-DISCOVER_DROPOFFS = os.getenv("OZON_DISCOVER_DROPOFFS", "1").lower() in ("1", "true", "yes", "y")
+# Важно: по умолчанию не навязываем drop-only, чтобы можно было получать складские timeslots с id
+STRICT_DROP_ONLY = _get_bool_env("STRICT_DROP_ONLY", "SLOT_STRICT_DROP_ONLY", default=False)
+
+DISCOVER_DROPOFFS = _get_bool_env("DISCOVER_DROPOFFS", "OZON_DISCOVER_DROPOFFS", default=False)
+
 FBO_LIST_SUPPLY_TYPES: List[str] = [
     s.strip()
     for s in (os.getenv("OZON_FBO_LIST_SUPPLY_TYPES", "WAREHOUSE_SUPPLY_TYPE_FBO") or "").split(",")
     if s.strip()
 ] or ["WAREHOUSE_SUPPLY_TYPE_FBO"]
-STUB_FBO_LIST = os.getenv("OZON_STUB_FBO_LIST", "1").lower() in ("1", "true", "yes", "y")
-USE_CLUSTER_WIDS = os.getenv("OZON_USE_CLUSTER_WIDS", "1").lower() in ("1", "true", "yes", "y")
+
+STUB_FBO_LIST = _get_bool_env("STUB_FBO_LIST", "OZON_STUB_FBO_LIST", default=True)
+USE_CLUSTER_WIDS = _get_bool_env("USE_CLUSTER_WIDS", "OZON_USE_CLUSTER_WIDS", default=True)
 
 # Управление fallback-логикой timeslot: ретраи на другие WID и discover-запросы без drop_off
-DISABLE_TS_FALLBACK = os.getenv("OZON_TIMESLOT_DISABLE_FALLBACK", "1").lower() in ("1", "true", "yes", "y")
+# По умолчанию включено (True) — НЕ добавляем drop в payload, если его не было.
+DISABLE_TS_FALLBACK = _get_bool_env("DISABLE_TS_FALLBACK", "OZON_TIMESLOT_DISABLE_FALLBACK", default=True)
 
 # ВАЖНО: читаем оба ключа, приоритет у AUTO_BOOK. По умолчанию ВЫКЛЮЧЕНО.
 AUTO_BOOK = _get_bool_env("AUTO_BOOK", "OZON_AUTO_BOOK", default=False)
 
-REQUIRE_SUPPLY_ID = os.getenv("REQUIRE_SUPPLY_ID", "0").lower() in ("1", "true", "yes", "y")
-PROGRESS_TASK_ON_BOOK = os.getenv("PROGRESS_TASK_ON_BOOK", "1").lower() in ("1", "true", "yes", "y")
+REQUIRE_SUPPLY_ID = _get_bool_env("REQUIRE_SUPPLY_ID", default=False)
+PROGRESS_TASK_ON_BOOK = _get_bool_env("PROGRESS_TASK_ON_BOOK", default=True)
 
 BOOKED_STATUS_NAME = os.getenv("BOOKED_STATUS_NAME", "booked").strip() or "booked"
 BOOKED_ALT_STATUSES = [s.strip() for s in (os.getenv("BOOKED_ALT_STATUSES", "timeslot_booked,slot_booked,booked_ok") or "").split(",") if s.strip()]
@@ -85,6 +90,9 @@ _BOOKED_RESULTS: Dict[int, Dict[str, Any]] = {}
 _ORIG_SYNC_POST = httpx.Client.post
 _ORIG_ASYNC_POST = httpx.AsyncClient.post
 
+# --- helpers ---
+def _has_drop_fields(js: Dict[str, Any]) -> bool:
+    return any(k in js for k in ("drop_off_point_warehouse_id", "drop_off_warehouse_id", "dropoff_warehouse_id", "dropoffWarehouseId"))
 
 def _as_utc_iso(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -226,14 +234,52 @@ def _reorder_or_filter_to_drop_only(resp_json: Dict[str, Any]) -> Dict[str, Any]
     return resp_json_mod
 
 
-def _build_timeslot_payload(base_js: Dict[str, Any]) -> Dict[str, Any]:
+def _build_timeslot_payload(base_js: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
+    """
+    Готовим payload для /v1/draft/timeslot/info.
+    - Сохраняем исходные date_from/date_to, если они уже есть (чтобы не "ломать" окно, заданное верхним слоем).
+    - УВАЖАЕМ режим: если верхний слой НЕ прислал drop_off-поля и DISABLE_TS_FALLBACK=True — НЕ подставляем drop.
+      Если STRICT_DROP_ONLY=True — подставляем drop всегда.
+      Если DISABLE_TS_FALLBACK=False — можно мягко подставить drop, если его нет.
+    Возвращаем (payload, mode_is_drop).
+    """
     js = deepcopy(base_js) if base_js else {}
+
+    had_drop = _has_drop_fields(js)
     if DROP_ID:
-        js["drop_off_warehouse_id"] = int(DROP_ID)
-    df, dt = _compute_window_now_local(SLOT_SEARCH_DAYS, DROP_TZ)
-    js["date_from"] = df
-    js["date_to"] = dt
-    return js
+        if STRICT_DROP_ONLY:
+            if not had_drop:
+                js["drop_off_point_warehouse_id"] = int(DROP_ID)
+                js.setdefault("drop_off_warehouse_id", int(DROP_ID))
+                js.setdefault("dropoff_warehouse_id", int(DROP_ID))
+                js.setdefault("dropoffWarehouseId", int(DROP_ID))
+            mode_is_drop = True
+        else:
+            if not had_drop:
+                if not DISABLE_TS_FALLBACK:
+                    # мягкий фоллбэк разрешён
+                    js["drop_off_point_warehouse_id"] = int(DROP_ID)
+                    js.setdefault("drop_off_warehouse_id", int(DROP_ID))
+                    js.setdefault("dropoff_warehouse_id", int(DROP_ID))
+                    js.setdefault("dropoffWarehouseId", int(DROP_ID))
+                    mode_is_drop = True
+                else:
+                    # warehouse-режим — не подставляем drop
+                    mode_is_drop = False
+            else:
+                mode_is_drop = True
+    else:
+        mode_is_drop = False
+
+    # window handling: если верхний слой уже дал окно — не трогаем
+    df = js.get("date_from") or js.get("from")
+    dt = js.get("date_to") or js.get("to")
+    if not (df and dt):
+        auto_df, auto_dt = _compute_window_now_local(SLOT_SEARCH_DAYS, DROP_TZ)
+        js.setdefault("date_from", auto_df)
+        js.setdefault("date_to", auto_dt)
+
+    return js, mode_is_drop
 
 
 def _normalize_warehouse_ids_with_cluster(js: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
@@ -1232,7 +1278,7 @@ def _install_sync_post_patch():
 
             if url.endswith("/v1/draft/timeslot/info"):
                 js = kwargs.get("json") or {}
-                js = _build_timeslot_payload(js)
+                js, mode_is_drop = _build_timeslot_payload(js)
                 js, changed = _normalize_warehouse_ids_with_cluster(js)
                 if changed:
                     logger.warning("final json(timeslot/info) payload adjusted by cluster: %s", json.dumps(js, ensure_ascii=False))
@@ -1263,7 +1309,8 @@ def _install_sync_post_patch():
                             override_wid = int(wid2)
                             logger.info("timeslot: using fallback warehouse_id=%s", wid2)
 
-                    mod = _reorder_or_filter_to_drop_only(data)
+                    # ВАЖНО: не навязываем drop-only формат, если запрос был в warehouse-режиме
+                    mod = _reorder_or_filter_to_drop_only(data) if mode_is_drop else data
                     if mod is not data:
                         resp = _apply_mod_and_rebuild_response(resp, mod)
 
@@ -1277,6 +1324,9 @@ def _install_sync_post_patch():
                     if (not DISABLE_TS_FALLBACK) and drop_item is None and DISCOVER_DROPOFFS:
                         discover_js = deepcopy(js)
                         discover_js.pop("drop_off_warehouse_id", None)
+                        discover_js.pop("drop_off_point_warehouse_id", None)
+                        discover_js.pop("dropoff_warehouse_id", None)
+                        discover_js.pop("dropoffWarehouseId", None)
                         logger.warning("timeslot discover: retry without drop_off to list available drop-offs")
                         fb_resp = _ORIG_SYNC_POST(self, url, json=discover_js, headers=kwargs.get("headers"))
                         if fb_resp.status_code == 200:
@@ -1350,7 +1400,7 @@ def _install_async_post_patch():
 
             if url.endswith("/v1/draft/timeslot/info"):
                 js = kwargs.get("json") or {}
-                js = _build_timeslot_payload(js)
+                js, mode_is_drop = _build_timeslot_payload(js)
                 js, changed = _normalize_warehouse_ids_with_cluster(js)
                 if changed:
                     logger.warning("final json(timeslot/info) payload adjusted by cluster: %s", json.dumps(js, ensure_ascii=False))
@@ -1381,7 +1431,8 @@ def _install_async_post_patch():
                             override_wid = int(wid2)
                             logger.info("timeslot(async): using fallback warehouse_id=%s", wid2)
 
-                    mod = _reorder_or_filter_to_drop_only(data)
+                    # Не навязываем drop-only модификацию, если запрос шёл в warehouse-режиме
+                    mod = _reorder_or_filter_to_drop_only(data) if mode_is_drop else data
                     if mod is not data:
                         resp = _apply_mod_and_rebuild_response(resp, mod)
 
@@ -1395,6 +1446,9 @@ def _install_async_post_patch():
                     if (not DISABLE_TS_FALLBACK) and drop_item is None and DISCOVER_DROPOFFS:
                         discover_js = deepcopy(js)
                         discover_js.pop("drop_off_warehouse_id", None)
+                        discover_js.pop("drop_off_point_warehouse_id", None)
+                        discover_js.pop("dropoff_warehouse_id", None)
+                        discover_js.pop("dropoffWarehouseId", None)
                         logger.warning("timeslot discover(async): retry without drop_off to list available drop-offs")
                         new_kwargs = {k: v for k, v in kwargs.items() if k != "json"}
                         fb_resp = await _ORIG_ASYNC_POST(self, url, *args, json=discover_js, **new_kwargs)

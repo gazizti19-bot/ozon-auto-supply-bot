@@ -34,6 +34,10 @@ def as_utc_iso(dt: datetime) -> str:
 
 
 def compute_window_next_local_midnight(days: int, tzname: str) -> Tuple[str, str]:
+    """
+    Возвращает окно поиска слотов [date_from, date_to] в UTC (строки ISO Z),
+    где date_from — полночь следующего дня, date_to — +days от этой полуночи минус секунда.
+    """
     tz = ZoneInfo(tzname) if ZoneInfo else None
     now_utc = datetime.now(timezone.utc)
     if tz:
@@ -51,6 +55,32 @@ def short(txt: str, limit: int = 300) -> str:
     return txt if len(txt) <= limit else txt[:limit] + "...(truncated)"
 
 
+def to_utc_z(iso_str: str) -> Optional[str]:
+    """
+    Конвертирует произвольную ISO строку (c оффсетом или Z) в UTC '...Z'.
+    """
+    if not iso_str:
+        return None
+    s = iso_str.strip()
+    if s.endswith("Z"):
+        return s
+    try:
+        # '+05:00' поддерживается стандартным парсером
+        dt = datetime.fromisoformat(s)
+        return as_utc_iso(dt)
+    except Exception:
+        try:
+            # Иногда приходит без разделителя 'T' или с миллисекундами без 'Z' — легкая нормализация
+            if " " in s:
+                s = s.replace(" ", "T")
+            if "+" not in s and "Z" not in s:
+                # предположим локальную и интерпретируем как UTC (последний шанс)
+                return as_utc_iso(datetime.fromisoformat(s).replace(tzinfo=timezone.utc))
+        except Exception:
+            return None
+    return None
+
+
 @dataclass
 class OzonClient:
     client_id: str
@@ -66,6 +96,7 @@ class OzonClient:
             "Client-Id": self.client_id,
             "Api-Key": self.api_key,
             "Content-Type": "application/json",
+            "Accept": "application/json",
         }
 
     def post(self, path: str, json_body: Dict[str, Any]) -> httpx.Response:
@@ -78,7 +109,11 @@ class OzonClient:
                     resp = s.post(url, json=json_body, headers=self._headers())
                     if resp.status_code == 429 and attempt <= self.max_retries:
                         # Respect server backoff if provided
-                        delay = min(self.backoff_base * attempt, self.backoff_cap)
+                        hdr = resp.headers.get("Retry-After")
+                        if hdr and str(hdr).strip().isdigit():
+                            delay = min(float(hdr), self.backoff_cap)
+                        else:
+                            delay = min(self.backoff_base * attempt, self.backoff_cap)
                         logger.warning("429 for %s -> wait %.2fs (attempt %d)", url, delay, attempt)
                         time.sleep(delay)
                         continue
@@ -134,10 +169,7 @@ def draft_create_info_wait(oz: OzonClient, operation_id: str, timeout_s: int = 1
     if final is None:
         raise TimeoutError("Timeout waiting for /v1/draft/create/info success")
 
-    draft_id = final.get("draft_id")
-    if not draft_id:
-        # some variants return draft_id inside payload; attempt to find
-        draft_id = final.get("result", {}).get("draft_id")
+    draft_id = final.get("draft_id") or final.get("result", {}).get("draft_id")
     if not draft_id:
         raise RuntimeError("No draft_id in /v1/draft/create/info result")
 
@@ -145,8 +177,19 @@ def draft_create_info_wait(oz: OzonClient, operation_id: str, timeout_s: int = 1
     return final
 
 
-def draft_timeslot_info(oz: OzonClient, draft_id: int, warehouse_ids: List[int], days: int, tzname: str,
-                        drop_off_point_warehouse_id: Optional[int] = None) -> Dict[str, Any]:
+def draft_timeslot_info(
+    oz: OzonClient,
+    draft_id: int,
+    warehouse_ids: List[int],
+    days: int,
+    tzname: str,
+    drop_off_point_warehouse_id: Optional[int] = None
+) -> Dict[str, Any]:
+    """
+    Ищем слоты ТОЛЬКО через date_from/date_to (UTC), как рекомендовала поддержка.
+    В запросе передаём warehouse_ids (склады размещения).
+    В ответе слоты приходят по drop_off_warehouse (пункт отгрузки) — это норма для cross-dock.
+    """
     df, dt = compute_window_next_local_midnight(days, tzname)
     payload: Dict[str, Any] = {
         "draft_id": int(draft_id),
@@ -154,7 +197,7 @@ def draft_timeslot_info(oz: OzonClient, draft_id: int, warehouse_ids: List[int],
         "date_to": dt,
         "warehouse_ids": [int(x) for x in warehouse_ids],
     }
-    # optional; API for crossdock returns slots by drop-off; harmless to pass explicitly
+    # Не обязателен. Допустимо явно указать drop-off, но API и так вернёт по drop-off
     if drop_off_point_warehouse_id:
         payload["drop_off_warehouse_id"] = int(drop_off_point_warehouse_id)
 
@@ -163,7 +206,13 @@ def draft_timeslot_info(oz: OzonClient, draft_id: int, warehouse_ids: List[int],
     return resp.json()
 
 
-def pick_first_slot_for_drop(resp_json: Dict[str, Any], drop_off_id: int) -> Optional[Tuple[str, str]]:
+def pick_first_slot_for_drop(resp_json: Dict[str, Any], drop_off_id: int) -> Optional[Dict[str, Any]]:
+    """
+    Возвращает словарь для установки слота:
+    - если в слоте есть id: {"drop_off_point_warehouse_id":<id>, "timeslot":{"id":"..."}}
+    - иначе: {"drop_off_point_warehouse_id":<id>, "timeslot":{"start_time":"...Z","end_time":"...Z"}}
+    Также возвращает удобные поля "from_in_timezone"/"to_in_timezone" в корне для дальнейшей брони.
+    """
     arr = resp_json.get("drop_off_warehouse_timeslots")
     if not isinstance(arr, list):
         return None
@@ -175,24 +224,65 @@ def pick_first_slot_for_drop(resp_json: Dict[str, Any], drop_off_id: int) -> Opt
             for d in days:
                 slots = d.get("timeslots") or []
                 for s in slots:
-                    f = s.get("from_in_timezone") or s.get("fromInTimezone") or s.get("from")
-                    t = s.get("to_in_timezone") or s.get("toInTimezone") or s.get("to")
-                    if f and t:
-                        return str(f), str(t)
+                    f_local = s.get("from_in_timezone") or s.get("fromInTimezone") or s.get("from")
+                    t_local = s.get("to_in_timezone") or s.get("toInTimezone") or s.get("to")
+                    slot_id = s.get("id") or s.get("timeslot_id") or s.get("slot_id")
+                    if not (f_local and t_local):
+                        continue
+                    pick: Dict[str, Any] = {
+                        "drop_off_point_warehouse_id": int(drop_off_id),
+                        "from_in_timezone": str(f_local),
+                        "to_in_timezone": str(t_local),
+                    }
+                    if slot_id:
+                        pick["timeslot"] = {"id": slot_id}
+                    else:
+                        f_z = to_utc_z(str(f_local))
+                        t_z = to_utc_z(str(t_local))
+                        if f_z and t_z:
+                            pick["timeslot"] = {"start_time": f_z, "end_time": t_z}
+                        else:
+                            # если не смогли конвертировать — пропускаем слот
+                            continue
+                    return pick
         except Exception:
             continue
     return None
 
 
+def draft_timeslot_set(
+    oz: OzonClient,
+    draft_id: int,
+    drop_off_point_warehouse_id: int,
+    timeslot: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    Установка таймслота в черновике (канонический путь):
+    POST /v1/draft/timeslot/set
+    timeslot: либо {"id": "..."} либо {"start_time": "...Z", "end_time": "...Z"} (UTC)
+    """
+    body = {
+        "id": int(draft_id),
+        "drop_off_point_warehouse_id": int(drop_off_point_warehouse_id),
+        "timeslot": dict(timeslot),
+    }
+    resp = oz.post("/v1/draft/timeslot/set", body)
+    resp.raise_for_status()
+    return resp.json()
+
+
 def supply_create(oz: OzonClient, draft_id: int, warehouse_ids: List[int], f_tz: str, t_tz: str) -> str:
     """
-    According to your doc, booking is done by /v1/draft/supply/create
-    Body requires: draft_id, warehouse_ids, from_in_timezone, to_in_timezone
-    Returns: operation_id for status polling
+    Бронирование окна:
+    POST /v1/draft/supply/create
+    Требует: draft_id, warehouse_id (берём первый из списка), from_in_timezone, to_in_timezone.
+    Возвращает operation_id для /v1/draft/supply/create/status
     """
+    if not warehouse_ids:
+        raise ValueError("warehouse_ids must contain at least one placement warehouse id")
     payload = {
         "draft_id": int(draft_id),
-        "warehouse_ids": [int(x) for x in warehouse_ids],
+        "warehouse_id": int(warehouse_ids[0]),  # используем первый склад
         "from_in_timezone": f_tz,
         "to_in_timezone": t_tz,
     }
@@ -222,7 +312,7 @@ def supply_create_status_wait(oz: OzonClient, operation_id: str, timeout_s: int 
             raise RuntimeError(f"Supply create failed: {short(resp.text)}")
         time.sleep(poll_s)
     if not last:
-        raise TimeoutError("No response from /v1/draft/supply/create/status")
+        raise TimeoutError("No response from /v1/draft/supply/create/info")
     return last
 
 
@@ -235,21 +325,48 @@ def supply_order_get(oz: OzonClient, order_id: int) -> Dict[str, Any]:
 # -----------------------
 # Stage 5: Cargoes create → info
 # -----------------------
-def cargoes_create(oz: OzonClient, supply_id: int, cargoes: List[Dict[str, Any]], delete_current_version: bool = False) -> str:
+def _sanitize_cargoes_canonical(cargoes: List[Dict[str, Any]], cargo_type_default: str = "BOX") -> List[Dict[str, Any]]:
     """
-    Sends cargoes for the given supply.
-    Body shape may differ per account; here we follow your doc:
-    key, type, supply_id (+ optional items). We wrap into 'cargoes' and pass delete_current_version.
-    Returns: operation_id to poll in /v1/cargoes/create/info
+    Канонический формат каждого cargo:
+      {"key":"...","cargo_type":"BOX","items":[{"sku":..., "quantity":...}]}
+    Без алиасов type/cargoType/CargoType и без supply_id внутри cargo.
+    """
+    out: List[Dict[str, Any]] = []
+    for c in cargoes:
+        cc = dict(c)
+        # удаляем алиасы
+        for alias in ("type", "cargoType", "CargoType", "cargo_type"):
+            if alias in cc:
+                cc.pop(alias, None)
+        # supply_id должен быть на верхнем уровне, не внутри cargo
+        cc.pop("supply_id", None)
+        # гарантируем ключ и тип груза
+        if "key" not in cc:
+            cc["key"] = str(uuid.uuid4())
+        cc["cargo_type"] = cargo_type_default
+        # items допускаются пустые, но лучше передавать состав при необходимости
+        items = cc.get("items")
+        if items is not None and not isinstance(items, list):
+            raise ValueError("cargo.items must be a list when provided")
+        out.append({"key": cc["key"], "cargo_type": cc["cargo_type"], "items": items or []})
+    return out
+
+
+def cargoes_create(oz: OzonClient, supply_id: int, cargoes: List[Dict[str, Any]], delete_current_version: bool = True) -> str:
+    """
+    Отправляет грузы в каноническом формате:
+      {
+        "supply_id": <id>,
+        "delete_current_version": true,
+        "cargoes": [{"key":"...","cargo_type":"BOX","items":[...]}]
+      }
+    Возвращает operation_id для /v1/cargoes/create/info
     """
     body = {
+        "supply_id": int(supply_id),
         "delete_current_version": bool(delete_current_version),
-        "cargoes": cargoes,
+        "cargoes": _sanitize_cargoes_canonical(cargoes, cargo_type_default="BOX"),
     }
-    # Ensure each cargo has supply_id; if not, inject it
-    for c in body["cargoes"]:
-        c.setdefault("supply_id", int(supply_id))
-
     resp = oz.post("/v1/cargoes/create", body)
     resp.raise_for_status()
     op = resp.json().get("operation_id")
@@ -335,6 +452,9 @@ def cargoes_label_download(oz: OzonClient, file_guid: str, out_path: str) -> Non
 # -----------------------
 # Stage 7: Timeslot update, Pass create, Pass status
 # -----------------------
+# В флоу черновиков тайм-слот следует закреплять через /v1/draft/timeslot/set (см. draft_timeslot_set).
+# Методы supply-order/* оставлены как опциональные/на будущее, могут быть недоступны (404) в вашем кабинете.
+
 def supply_order_timeslot_update(oz: OzonClient, order_id: int, f_tz: str, t_tz: str) -> Dict[str, Any]:
     resp = oz.post("/v1/supply-order/timeslot/update", {
         "order_id": int(order_id),
@@ -375,7 +495,7 @@ def run_end_to_end() -> Dict[str, Any]:
     """
     A complete example of the flow:
     1) Create draft (crossdock) -> wait calc -> get draft_id + cluster
-    2) Get timeslots -> choose first for drop-off
+    2) Get timeslots -> choose first for drop-off -> SET TIMESLOT IN DRAFT
     3) Create supply (booking) -> wait status -> get supply order
     4) OPTIONAL: create cargoes, wait, labels
     """
@@ -389,22 +509,20 @@ def run_end_to_end() -> Dict[str, Any]:
     oz = OzonClient(client_id=client_id, api_key=api_key, base_url=base_url)
 
     # 1) Create draft (crossdock)
-    # Provide real SKUs and quantities here
     items = [
         {"sku": 2625768907, "quantity": 10},
         # add more if needed
     ]
     operation_id = draft_create_crossdock(oz, items, drop_off_point_warehouse_id=drop_off_id)
     info = draft_create_info_wait(oz, operation_id)
-    draft_id = info.get("draft_id")
+    draft_id = info.get("draft_id") or info.get("result", {}).get("draft_id")
     if not draft_id:
         raise RuntimeError("draft_id not found in create/info result")
 
     # Choose a supply warehouse from clusters (first is fine)
-    clusters = info.get("clusters") or []
+    clusters = info.get("clusters") or info.get("result", {}).get("clusters") or []
     if not clusters:
         raise RuntimeError("No clusters returned by /v1/draft/create/info")
-    # Take first cluster's first warehouse supply_warehouse_id
     first_wids: List[int] = []
     for c in clusters:
         for wh in (c.get("warehouses") or []):
@@ -416,7 +534,7 @@ def run_end_to_end() -> Dict[str, Any]:
         raise RuntimeError("No supply warehouse ids found in clusters")
     supply_wid = first_wids[0]
 
-    # 2) Get timeslots
+    # 2) Get timeslots (info)
     ts_info = draft_timeslot_info(
         oz,
         draft_id=int(draft_id),
@@ -425,16 +543,22 @@ def run_end_to_end() -> Dict[str, Any]:
         tzname=tzname,
         drop_off_point_warehouse_id=drop_off_id or None,
     )
-    slot = pick_first_slot_for_drop(ts_info, drop_off_id=drop_off_id) if drop_off_id else None
-    if not slot:
-        # Fallback: pick the very first slot in the entire response if drop_off filter isn't applicable
-        slot = pick_first_slot_for_drop({"drop_off_warehouse_timeslots": [{"drop_off_warehouse_id": drop_off_id, "days": ts_info.get("days") or []}]}, drop_off_id)  # defensive
-    if not slot:
+    pick = pick_first_slot_for_drop(ts_info, drop_off_id=drop_off_id) if drop_off_id else None
+    if not pick:
+        # Нет явного слота для конкретного drop_off — попробуем взять первый слота вообще (если структура иная)
         raise RuntimeError("No available timeslots found for the selected drop-off")
-    f_tz, t_tz = slot
-    logger.info("Chosen timeslot: %s -> %s (tz)", f_tz, t_tz)
+    # 2.1) SET TIMESLOT IN DRAFT (канон)
+    draft_timeslot_set(
+        oz,
+        draft_id=int(draft_id),
+        drop_off_point_warehouse_id=int(pick["drop_off_point_warehouse_id"]),
+        timeslot=pick["timeslot"],
+    )
+    f_tz = pick["from_in_timezone"]
+    t_tz = pick["to_in_timezone"]
+    logger.info("Chosen timeslot (local): %s -> %s", f_tz, t_tz)
 
-    # 3) Create supply (this is the booking step per your spec)
+    # 3) Create supply (booking)
     op_supply = supply_create(oz, draft_id=int(draft_id), warehouse_ids=[supply_wid], f_tz=f_tz, t_tz=t_tz)
     st = supply_create_status_wait(oz, op_supply)
     order_id = st.get("order_id") or st.get("result", {}).get("order_id")
@@ -449,23 +573,22 @@ def run_end_to_end() -> Dict[str, Any]:
     logger.info("Supply order created: number=%s, order_id=%s, supply_id=%s, deadline=%s",
                 supply_order_number, order_id, supply_id, data_filling_deadline_utc)
 
-    # 5) OPTIONAL: create cargoes → info
-    # Fill items for each cargo according to your catalogue (SKU/qty set). Below is a minimal example.
+    # 5) OPTIONAL: create cargoes → info (канон cargo_type=BOX per cargo)
     cargo_key = str(uuid.uuid4())
     cargoes = [
         {
             "key": cargo_key,
-            "type": "BOX",  # or "PALLET"
-            # "items": [{"sku": 2625768907, "quantity": 10}],  # Add composition if required by your tenant
+            "cargo_type": "BOX",
+            "items": [{"sku": 2625768907, "quantity": 10}],
         }
     ]
-    op_cargo = cargoes_create(oz, int(supply_id), cargoes, delete_current_version=False)
+    op_cargo = cargoes_create(oz, int(supply_id), cargoes, delete_current_version=True)
     cargo_info = cargoes_create_info_wait(oz, op_cargo)
-    # The exact shape may include cargo_ids per cargo; leave as-is for your parsing
+    logger.info("Cargo create info: %s", short(json.dumps(cargo_info, ensure_ascii=False)))
 
     # 6) Labels: create → get → download
     op_lbl = cargoes_label_create(oz, supply_id=int(supply_id))
-    file_guid, lbl_get = cargoes_label_get_wait(oz, op_lbl)
+    file_guid, _lbl_get = cargoes_label_get_wait(oz, op_lbl)
     out_pdf = f"labels_{supply_order_number or supply_id}.pdf"
     cargoes_label_download(oz, file_guid, out_pdf)
 

@@ -52,18 +52,12 @@ except Exception:
 # =========================== Env (drop-off) ===========================
 
 def _normalize_name(s: str) -> str:
-    # Приводим к верхнему регистру, убираем небуквенно-цифровые, заменяем подряд идущие пробелы
     s = (s or "").strip()
     s = s.replace("_", " ").replace("-", " ")
     s = re.sub(r"\s+", " ", s, flags=re.IGNORECASE)
     return s.upper()
 
 def _fetch_dropoff_map_from_ozon() -> Dict[str, int]:
-    """
-    Тянем список FBO точек (drop-off) из Ozon:
-    POST /v1/warehouse/fbo/list
-    Возвращаем карту name -> warehouse_id
-    """
     client_id = os.getenv("OZON_CLIENT_ID", "").strip()
     api_key = os.getenv("OZON_API_KEY", "").strip()
     if not client_id or not api_key:
@@ -71,11 +65,7 @@ def _fetch_dropoff_map_from_ozon() -> Dict[str, int]:
         return {}
 
     url = "https://api-seller.ozon.ru/v1/warehouse/fbo/list"
-    headers = {
-        "Client-Id": client_id,
-        "Api-Key": api_key,
-        "Content-Type": "application/json",
-    }
+    headers = {"Client-Id": client_id, "Api-Key": api_key, "Content-Type": "application/json"}
     try:
         with httpx.Client(timeout=15.0) as s:
             r = s.post(url, headers=headers, json={})
@@ -87,11 +77,9 @@ def _fetch_dropoff_map_from_ozon() -> Dict[str, int]:
         logging.warning("env drop-off resolve: request failed: %s", e)
         return {}
 
-    # Ищем список объектов с полями name и warehouse_id
     result: Dict[str, int] = {}
     def _dig(obj):
         if isinstance(obj, dict):
-            # Кандидат: содержит name и warehouse_id
             if "name" in obj and any(k in obj for k in ("warehouse_id", "warehouseId", "id")):
                 try:
                     wid = obj.get("warehouse_id", obj.get("warehouseId", obj.get("id")))
@@ -112,13 +100,6 @@ def _fetch_dropoff_map_from_ozon() -> Dict[str, int]:
     return result
 
 def _env_dropoff() -> Tuple[Optional[str], Optional[int]]:
-    """
-    Берём drop-off из окружения:
-      - OZON_DROP_OFF_ID (числовой id)
-      - OZON_DROP_OFF_NAME (название — маппим в id)
-    Делаем валидацию через API Ozon (/v1/warehouse/fbo/list).
-    Возвращаем (name, id)
-    """
     env_name = (os.getenv("OZON_DROP_OFF_NAME") or "").strip() or None
     raw_id = (os.getenv("OZON_DROP_OFF_ID") or "").strip()
     env_id: Optional[int] = None
@@ -128,7 +109,6 @@ def _env_dropoff() -> Tuple[Optional[str], Optional[int]]:
         except Exception:
             env_id = None
 
-    # 1) Пытаемся картой локальных маппингов (если есть отдельный dropoff_mapping)
     mapped_local: Optional[int] = None
     if env_name:
         try:
@@ -143,12 +123,10 @@ def _env_dropoff() -> Tuple[Optional[str], Optional[int]]:
         except Exception:
             mapped_local = None
 
-    # 2) Тянем карту с API Ozon и валидируем
-    remote = _fetch_dropoff_map_from_ozon()  # name -> id
+    remote = _fetch_dropoff_map_from_ozon()
     chosen_name = None
     chosen_id = None
 
-    # Если указан id — проверим, существует ли среди drop-off
     if env_id is not None:
         if env_id in remote.values() or not remote:
             chosen_id = env_id
@@ -156,20 +134,16 @@ def _env_dropoff() -> Tuple[Optional[str], Optional[int]]:
         else:
             logging.warning("ENV drop-off id=%s not found in Ozon drop-off list; will attempt resolve by name", env_id)
 
-    # Если id не выбран — попробуем по имени
     if chosen_id is None and env_name:
-        # 2.1) точное совпадение по имени
         if env_name in remote:
             chosen_name = env_name
             chosen_id = remote[env_name]
         else:
-            # 2.2) нормализованное сопоставление
             target = _normalize_name(env_name)
             candidates = [(nm, wid) for nm, wid in remote.items() if _normalize_name(nm) == target]
             if candidates:
                 chosen_name, chosen_id = candidates[0]
             else:
-                # 2.3) подстрочное совпадение (например, “УФА”)
                 parts = [p for p in target.split() if len(p) >= 3]
                 for nm, wid in remote.items():
                     norm_nm = _normalize_name(nm)
@@ -177,12 +151,10 @@ def _env_dropoff() -> Tuple[Optional[str], Optional[int]]:
                         chosen_name, chosen_id = nm, wid
                         break
 
-    # 3) В крайнем случае — локальный маппинг по имени, если он есть
     if chosen_id is None and mapped_local is not None:
         chosen_id = mapped_local
         chosen_name = env_name
 
-    # 4) Логи
     if chosen_id is not None:
         if chosen_name:
             logging.info("ENV drop-off resolved: %s -> id=%s", chosen_name, chosen_id)
@@ -225,11 +197,21 @@ def _find_task_by_id_or_sku(token: str):
     token = (token or "").strip()
     if not token:
         return None
-    for t in sw.list_tasks():
-        if str(t.get("id")) == token or sw.short(str(t.get("id"))) == token:
+    # По id либо short(id)
+    for t in sw.list_all_tasks():
+        tid = str(t.get("id") or "")
+        if tid == token or sw.short(tid) == token:
             return t
-    t = sw.get_info(token)
-    return t
+    # По SKU (если число)
+    if token.isdigit():
+        for t in sw.list_all_tasks():
+            try:
+                sku = (t.get("sku_list") or [{}])[0].get("sku")
+                if str(sku) == token:
+                    return t
+            except Exception:
+                continue
+    return None
 
 
 # =========================== Warehouse extraction (only supply from template) ===========================
@@ -292,13 +274,45 @@ def _resolve_name_by_id_generic(wid: Optional[int], keys_fn, resolve_fn) -> Opti
 
 # =========================== Payload normalizer ===========================
 
+# Все виды дефисов, которые встречаются у пользователей: - ‐ ‑ ‒ – — ― −
+_DASH_CHARS = "\u002D\u2010\u2011\u2012\u2013\u2014\u2015\u2212"
+PHONE_FINDER_RE = re.compile(r"(\+?\d[\d\-\s\(\)]{6,}\d)")
+ITEM_MARKERS_RE = re.compile(r"(кол-?\s*во|количеств|короб|шт\b)", re.IGNORECASE)
+
+def _canon_all_dashes(text: str) -> str:
+    if not isinstance(text, str):
+        return text
+    # узкие/неразрывные пробелы -> обычный пробел
+    text = text.replace("\u00A0", " ").replace("\u2009", " ").replace("\u202F", " ")
+    for ch in _DASH_CHARS:
+        text = text.replace(ch, "-")
+    # выровнять пробелы вокруг дефиса и сжать пробелы
+    text = re.sub(r"\s*-\s*", " - ", text)
+    text = re.sub(r"\s{2,}", " ", text)
+    return text.strip()
+
 def _normalize_basic(text: str) -> str:
+    text = _canon_all_dashes(text)
     text = re.sub(r"\bшт\.\b", "шт", text, flags=re.IGNORECASE)
     text = re.sub(r"\bштук(?:[а-я]*)\b", "шт", text, flags=re.IGNORECASE)
     text = re.sub(r"\bштуки\b", "шт", text, flags=re.IGNORECASE)
     text = re.sub(r"\s*,\s*", ", ", text)
     text = re.sub(r"[ \t]{2,}", " ", text)
     return text.strip()
+
+def _is_contact_line(s: str) -> bool:
+    """
+    Контактная строка — только если:
+      - найден телефонный паттерн И
+      - нет маркеров товарной позиции (кол-во/количество, коробка, шт) И
+      - есть явные признаки телефона/контакта: '+', '(', ')', '-' или запятая в строке
+    Это исключает SKU-линии вида '2625768907 — количество ...'
+    """
+    if not PHONE_FINDER_RE.search(s or ""):
+        return False
+    if ITEM_MARKERS_RE.search(s or ""):
+        return False
+    return ("+" in s) or ("(" in s) or (")" in s) or ("-" in s) or ("," in s)
 
 
 SKU_RE = re.compile(r"(\d{6,})")
@@ -370,7 +384,18 @@ def _split_header_and_items(payload: str) -> Tuple[str, List[str]]:
     return header, items
 
 
-def _build_canonical_line(item: Dict[str, Any], wh_tail: str) -> Optional[str]:
+def _boxes_word_ru(n: int) -> str:
+    n = int(n)
+    last = n % 10
+    last2 = n % 100
+    if last == 1 and last2 != 11:
+        return "коробка"
+    if 2 <= last <= 4 and not (12 <= last2 <= 14):
+        return "коробки"
+    return "коробок"
+
+
+def _build_canonical_line(item: Dict[str, Any], wh_tail: Optional[str]) -> Optional[str]:
     sku = item.get("sku")
     qty = item.get("qty")
     boxes = item.get("boxes")
@@ -386,17 +411,22 @@ def _build_canonical_line(item: Dict[str, Any], wh_tail: str) -> Optional[str]:
     if not (sku and isinstance(qty, int) and isinstance(boxes, int) and isinstance(per, int)):
         return None
 
-    return f"{sku} — количество {qty}, {boxes} коробки, по {per} шт, {wh_tail}"
+    # ВАЖНО: всегда используем обычный дефис '-' (не длинное тире)
+    base = f"{sku} - количество {qty}, {boxes} {_boxes_word_ru(boxes)}, по {per} шт"
+    if wh_tail:
+        return f"{base}, {wh_tail}"
+    return base
 
 
-def _construct_payload(header: str, parsed_items: List[Dict[str, Any]], wh_tail: str) -> Optional[str]:
+def _construct_payload(header: str, parsed_items: List[Dict[str, Any]], wh_tail: Optional[str]) -> Optional[str]:
     lines = [header]
     for it in parsed_items:
         canon = _build_canonical_line(it, wh_tail)
         if not canon:
             return None
         lines.append(canon)
-    return "\n".join(lines)
+    # унифицируем дефисы на всякий случай
+    return _canon_all_dashes("\n".join(lines))
 
 
 # =========================== Mapping helpers ===========================
@@ -486,7 +516,7 @@ async def cmd_schedule_supply(message: Message):
             "/schedule_supply FBO\n"
             "На 22.09.2025, 10:00-11:00\n"
             "Склад: ХОРУГВИНО_РФЦ\n"
-            "2625768907 — количество 10, 1 коробки, по 10 шт\n"
+            "2625768907 - количество 10, 1 коробка, по 10 шт\n"
             "(Drop-off берём из окружения: OZON_DROP_OFF_ID или OZON_DROP_OFF_NAME)"
             + hint_supply
         )
@@ -499,12 +529,29 @@ async def cmd_schedule_supply(message: Message):
     payload = _normalize_basic(payload)
 
     # 3) Заголовок и позиции
-    header, item_lines = _split_header_and_items(payload)
+    header, item_lines_all = _split_header_and_items(payload)
     if not header:
         await message.answer("Не найден заголовок с датой/окном (строка 'На <дата>, <окно>').")
         return
-    if not item_lines:
+    if not item_lines_all:
         await message.answer("Не найдены строки позиций (SKU).")
+        return
+
+    # 3.1) Отфильтруем служебные строки: глобальный склад и контакт (телефон)
+    item_lines: List[str] = []
+    for ln in item_lines_all:
+        ln_stripped = ln.strip()
+        if not ln_stripped:
+            continue
+        if WAREHOUSE_LINE_RE.match(ln_stripped):
+            continue
+        if _is_contact_line(ln_stripped):
+            # не позиция, а строка контакта
+            continue
+        item_lines.append(ln_stripped)
+
+    if not item_lines:
+        await message.answer("Не найдены строки позиций (после удаления служебных строк).")
         return
 
     # 4) Разбор позиций
@@ -513,9 +560,9 @@ async def cmd_schedule_supply(message: Message):
         parsed_items.append(_parse_item_line_freeform(ln))
 
     # 5) Хвост для канонического payload — имя склада приёмки
-    wh_tail = supply_name or "WAREHOUSE"
+    wh_tail: Optional[str] = supply_name or None
     if not supply_name and supply_id:
-        wh_tail = _resolve_name_by_id_generic(supply_id, available_keys, resolve_warehouse_id) or "WAREHOUSE"
+        wh_tail = _resolve_name_by_id_generic(supply_id, available_keys, resolve_warehouse_id)
 
     # 6) Соберём канонический payload под ваш парсер sw
     candidate_payload = _construct_payload(header, parsed_items, wh_tail)
@@ -523,26 +570,33 @@ async def cmd_schedule_supply(message: Message):
         await message.answer("Не хватает данных в строках позиций. Укажи SKU, количество, коробки и 'по N шт'.")
         return
 
-    # 7) Пред‑парсинг
+    # 7) Пред‑парсинг supply_watch (диагностика и автопочинка)
     try:
         sw.parse_template(candidate_payload)
     except Exception:
         logging.error("Pre-parse failed on canonical payload:\n%s", candidate_payload)
-        alts = [
-            candidate_payload.replace(" коробки, ", " коробка, "),
-            candidate_payload.replace(" коробки, ", " коробок, "),
-            candidate_payload.replace(" — количество", " - количество"),
-        ]
+        # Попробуем несколько безопасных вариантов автопочинки
+        alts = []
+        # корректная форма для 1 коробки
+        alts.append(re.sub(r",\s*1\s+коробки,", ", 1 коробка,", candidate_payload, flags=re.IGNORECASE))
+        # замена длинного тире на дефис (если где-то остался)
+        alts.append(candidate_payload.replace(" — ", " - ").replace("—", "-"))
+        # перестрахуемся: убрать хвост склада, если глобальный «Склад: ...» был и парсер его увидит
+        if supply_name:
+            alts.append(re.sub(r",\s*" + re.escape(supply_name) + r"\s*$", "", candidate_payload))
+
+        fixed = None
         for gv in alts:
             try:
                 sw.parse_template(gv)
-                candidate_payload = gv
+                fixed = gv
                 break
             except Exception:
                 continue
-        else:
+        if not fixed:
             await message.answer("Не удалось распарсить строки позиций. Пришли 2–3 реальные строки — подгоню правила.")
             return
+        candidate_payload = fixed
 
     # 8) drop-off из ENV c валидацией через API
     env_drop_name, env_drop_id = _env_dropoff()
@@ -571,10 +625,10 @@ async def cmd_schedule_supply(message: Message):
         # Маппинг supply-name -> id (если id не были заданы)
         _apply_mapping_to_tasks(created)
 
-        # Логи
+        # Логи (ВАЖНО: не подставляем supply_id — это warehouse_id, оставляем как есть)
         for t in created:
             logging.info(
-                "Created task id=%s supply_id=%s drop_off_id=%s window=%s %s-%s",
+                "Created task id=%s warehouse_id=%s drop_off_id=%s window=%s %s-%s",
                 t.get("id"),
                 t.get("warehouse_id") or t.get("chosen_warehouse_id"),
                 t.get("drop_off_warehouse_id") or t.get("drop_off_point_warehouse_id"),

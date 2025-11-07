@@ -3,21 +3,22 @@
 supply_watch.py
 Оркестратор авто-заявок поставки для Ozon Seller API.
 
-Основные этапы пайплайна:
-- DRAFT_CREATING -> POLL_DRAFT -> TIMESLOT_SEARCH -> SUPPLY_CREATING -> POLL_SUPPLY ->
-  SUPPLY_ORDER_FETCH/ORDER_DATA_FILLING -> CARGO_PREP -> CARGO_CREATING -> POLL_CARGO ->
-  LABELS_CREATING -> POLL_LABELS -> DONE
+Ключевые изменения в этом выпуске:
 
-Антизалипание на DRAFT_CREATING:
-- Inline-ожидание по умолчанию отключено (чтобы не застревать в “inline‑wait … then attempt”).
-- Если есть пейсинг (min-spacing) — планируем next_attempt_ts и выходим, помечая флагом __draft_pacing_scheduled_ts.
-- Процесс-тактовая квота учитывает пейсинг как «занятую» попытку в текущем тике.
-- Реальная попытка draft/create делается только когда пейсинг дал «зелёный свет».
+- Немедленное пересоздание черновика при 404 от /v1/draft/timeslot/info.
+  Если Ozon сообщает "Draft X doesn't exist", мы сразу помечаем черновик как отсутствующий,
+  очищаем draft_id/operation_id, логируем причину и запускаем новый /v1/draft/create
+  с прежними параметрами, затем продолжаем поиск тайм-слотов без каких-либо лимитов
+  на количество таких реинициализаций (до истечения окна задачи).
 
-Дополнительно:
-- Межпроцессная синхронизация слота на /v1/draft/create (file-lock в DATA_DIR).
-- «Тихий коридор» вокруг /v1/draft/create: подавляем прочие запросы к Ozon в ± небольшое окно.
-- Увеличенный backoff при 429 с текстом "per second"; сохраняем x-o3-trace-id для обращения в поддержку.
+- 404 от /v1/draft/timeslot/set по-прежнему НЕ приводит к пересозданию черновика:
+  метод считаем недоступным и двигаемся дальше к созданию заявки (как и ранее).
+
+- Для телеметрии добавлены/ведутся поля:
+  stale_draft_recreates (счётчик пересозданий по 404 timeslot/info),
+  last_draft_missing_ts (когда в последний раз увидели 404 на timeslot/info).
+- Исправлен NameError (_epoch).
+- Автоудаление “Создано”: по умолчанию включен немедленный снос (можно отключить).
 """
 
 from __future__ import annotations
@@ -32,7 +33,7 @@ import uuid
 import threading
 import random
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Callable, Awaitable
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -93,7 +94,8 @@ OPERATION_POLL_TIMEOUT_SECONDS = _getenv_int("OPERATION_POLL_TIMEOUT_SECONDS", 6
 
 SUPPLY_MAX_OPERATION_RETRIES = _getenv_int("SUPPLY_MAX_OPERATION_RETRIES", 25)
 
-AUTO_CREATE_CARGOES = _getenv_bool("AUTO_CREATE_CARGOES", True)
+# Автосоздание грузов ОТКЛЮЧЕНО по умолчанию
+AUTO_CREATE_CARGOES = _getenv_bool("AUTO_CREATE_CARGOES", False)
 AUTO_CREATE_LABELS = _getenv_bool("AUTO_CREATE_LABELS", True)
 AUTO_SEND_LABEL_PDF = _getenv_bool("AUTO_SEND_LABEL_PDF", True)
 
@@ -107,13 +109,12 @@ ON429_SHORT_RETRY_SEC = _getenv_int("ON429_SHORT_RETRY_SEC", 6)
 
 CREATE_INITIAL_BACKOFF = _getenv_int("CREATE_INITIAL_BACKOFF", 2)
 CREATE_MAX_BACKOFF = _getenv_int("CREATE_MAX_BACKOFF", 120)
-MIN_CREATE_RETRY_SECONDS = _getenv_int("MIN_CREATE_RETRY_SECONDS", 180)
 
 SUPPLY_CREATE_STAGE_DELAY_SECONDS = _getenv_int("SUPPLY_CREATE_STAGE_DELAY_SECONDS", 15)
 SUPPLY_CREATE_MIN_RETRY_SECONDS = _getenv_int("SUPPLY_CREATE_MIN_RETRY_SECONDS", 20)
 SUPPLY_CREATE_MAX_RETRY_SECONDS = _getenv_int("SUPPLY_CREATE_MAX_RETRY_SECONDS", 90)
 
-ORDER_FILL_POLL_INTERVAL_SECONDS = _getenv_int("ORDER_FILL_POLL_INTERVAL_SECONDS", 60)
+ORDER_FILL_POLL_INTERVAL_SECONDS = _getenv_int("ORDER_FILL_POLL_INTERVAL_SECONDS", 20)
 ORDER_FILL_MAX_RETRIES = _getenv_int("ORDER_FILL_MAX_RETRIES", 150)
 
 PROMPT_MIN_INTERVAL = _getenv_int("PROMPT_MIN_INTERVAL", 120)
@@ -130,19 +131,38 @@ SELF_WAKEUP_THRESHOLD_SECONDS = _getenv_int("SELF_WAKEUP_THRESHOLD_SECONDS", 180
 DRAFT_CREATE_MIN_SPACING_SECONDS = max(1, _getenv_int("DRAFT_CREATE_MIN_SPACING_SECONDS", 3))
 DRAFT_CREATE_MAX_BACKOFF = _getenv_int("DRAFT_CREATE_MAX_BACKOFF", 120)
 
-# Инлайн ожидание ВЫКЛ по умолчанию (ставьте >0, если хотите вернуть старое поведение)
-DRAFT_INLINE_WAIT_MAX_SEC = _getenv_int("DRAFT_INLINE_WAIT_MAX_SEC", 0)
-DRAFT_INLINE_WAIT_MAX_LOOPS = _getenv_int("DRAFT_INLINE_WAIT_MAX_LOOPS", 0)
-
-# Значение cargo_type по умолчанию
-OZON_CARGO_TYPE_DEFAULT = _getenv_str("OZON_CARGO_TYPE_DEFAULT", "CARGO_TYPE_BOX")
-
-# Внутренний гейт в supply_watch (можно отключить через ENV)
-SUPPLY_DISABLE_INTERNAL_GATE = _getenv_bool("SUPPLY_DISABLE_INTERNAL_GATE", False)
-
-# «Тихий коридор» вокруг draft/create
+# «Тихий коридор» вокруг create-эндпоинтов
 CREATE_QUIET_BEFORE_SEC = max(0.0, _getenv_float("CREATE_QUIET_BEFORE_SEC", 0.6))
 CREATE_QUIET_AFTER_SEC = max(0.0, _getenv_float("CREATE_QUIET_AFTER_SEC", 1.2))
+
+# Быстрый поллинг после установки тайм‑слота
+ORDER_FAST_POLL_SECONDS = _getenv_int("ORDER_FAST_POLL_SECONDS", 12)
+ORDER_FAST_POLL_WINDOW_SECONDS = _getenv_int("ORDER_FAST_POLL_WINDOW_SECONDS", 180)
+
+# Тайм‑аут ожидания supply_id
+ORDER_SUPPLY_ID_TIMEOUT_MIN = _getenv_int("ORDER_SUPPLY_ID_TIMEOUT_MIN", 20)
+
+# Периодический re-try установки тайм‑слота
+ORDER_TIMESLOT_REFRESH_SECONDS = _getenv_int("ORDER_TIMESLOT_REFRESH_SECONDS", 180)
+
+# Ссылки ЛК: используем только портал (чтобы не ловить 404 в карточке заявки)
+SELLER_PORTAL_URL = _getenv_str("SELLER_PORTAL_URL", "https://seller.ozon.ru").strip() or "https://seller.ozon.ru"
+
+# Сколько минут держать заявку со статусом "Создано", затем удалить автоматически
+AUTO_DELETE_CREATED_MINUTES = max(1, _getenv_int("AUTO_DELETE_CREATED_MINUTES", 10))
+# Немедленное удаление после финального сообщения — по умолчанию включено
+AUTO_DELETE_CREATED_IMMEDIATE = _getenv_bool("AUTO_DELETE_CREATED_IMMEDIATE", True)
+
+# Внутренний гейт пейсинга (если True — отключить внутренний пейсинг черновиков)
+SUPPLY_DISABLE_INTERNAL_GATE = _getenv_bool("SUPPLY_DISABLE_INTERNAL_GATE", False)
+
+# Слоты
+TIMESLOT_ALLOW_FALLBACK = _getenv_bool("TIMESLOT_ALLOW_FALLBACK", False)
+TIMESLOT_FALLBACK_DELTA_MIN = max(1, _getenv_int("TIMESLOT_FALLBACK_DELTA_MIN", 120))
+
+# Черновик: (грейс и макс ретраи оставлены для совместимости, но НE используются для timeslot/info 404)
+DRAFT_NOT_FOUND_GRACE_MIN = max(1, _getenv_int("DRAFT_NOT_FOUND_GRACE_MIN", 180))  # legacy
+DRAFT_NOT_FOUND_MAX_RETRIES = max(1, _getenv_int("DRAFT_NOT_FOUND_MAX_RETRIES", 999999))  # legacy
 
 # ================== Status Constants ==================
 
@@ -162,6 +182,9 @@ ST_POLL_LABELS = "POLL_LABELS"
 ST_DONE = "DONE"
 ST_FAILED = "FAILED"
 ST_CANCELED = "CANCELED"
+
+# Визуальная метка для UI — заявка "Создано"
+UI_STATUS_CREATED = "Создано"
 
 TZ_YEKAT = timezone(timedelta(hours=5))
 
@@ -192,18 +215,16 @@ def _parse_retry_after(headers: Dict[str, str]) -> int:
         ra = RATE_LIMIT_DEFAULT_COOLDOWN
     return max(1, min(int(ra), int(RATE_LIMIT_MAX_ON429)))
 
-# «Тихий коридор» для всех запросов, кроме /v1/draft/create
+# «Тихий коридор» для всех запросов, кроме create-эндпоинтов
 _CREATE_QUIET_UNTIL: float = 0.0
 _CREATE_QUIET_LOCK = asyncio.Lock()
 
 def _is_create_endpoint(path: str) -> bool:
     p = str(path or "").lower()
-    # только /v1/draft/create — самое «жёсткое» окно
-    return p.startswith("/v1/draft/create")
+    return p.startswith("/v1/draft/create") or p.startswith("/v1/draft/supply/create")
 
 async def _enter_quiet_before_create():
     global _CREATE_QUIET_UNTIL
-    # Раздвигаем «тихий коридор» на период ДО и ПОСЛЕ вызова create
     async with _CREATE_QUIET_LOCK:
         now = time.time()
         _CREATE_QUIET_UNTIL = max(_CREATE_QUIET_UNTIL, now + CREATE_QUIET_BEFORE_SEC + CREATE_QUIET_AFTER_SEC)
@@ -211,12 +232,10 @@ async def _enter_quiet_before_create():
         await asyncio.sleep(CREATE_QUIET_BEFORE_SEC)
 
 async def _wait_if_quiet(method: str, path: str):
-    # Пропускаем только сам create; остальным — подождать до конца «тихого окна»
     if _is_create_endpoint(path):
         return
     if CREATE_QUIET_BEFORE_SEC <= 0 and CREATE_QUIET_AFTER_SEC <= 0:
         return
-    # Ждём, пока «тихий коридор» не истечёт
     while True:
         until = _CREATE_QUIET_UNTIL
         if until <= 0:
@@ -246,11 +265,9 @@ class OzonApi:
         if self.mock:
             logging.info("MOCK %s %s payload_keys=%s", method, path, list((payload or {}).keys()))
             return True, {"mock": True, "path": path, "payload": payload}, "", 200, {}
-        # «Тихий коридор»: все, кроме create, ждут окончания окна
         try:
             await _wait_if_quiet(method, path)
         except Exception:
-            # не прерываем из-за ошибок ожидания
             pass
 
         client = _get_client()
@@ -357,6 +374,26 @@ def add_task(task: Dict[str, Any]):
     _tasks.append(task)
     save_tasks()
 
+def delete_task(task_id: str) -> bool:
+    ensure_loaded()
+    removed = False
+    with _sync_lock:
+        before = len(_tasks)
+        _tasks[:] = [t for t in _tasks if str(t.get("id")) != str(task_id)]
+        removed = len(_tasks) < before
+        if removed:
+            save_tasks()
+    return removed
+
+def purge_all_supplies_now() -> int:
+    ensure_loaded()
+    with _sync_lock:
+        count = len(_tasks)
+        _tasks.clear()
+        save_tasks()
+        logging.info("purge_all_supplies_now: removed=%s", count)
+        return count
+
 def _normalize_id(v: Any) -> Optional[str]:
     if v is None:
         return None
@@ -455,10 +492,11 @@ def update_task(*args: Any, **kwargs: Any) -> Dict[str, Any]:
 
         has_order = bool(target.get("order_id"))
         has_supply = bool(target.get("supply_id"))
+        is_verified = bool(target.get("supply_id_verified"))
         cur = str(target.get("status") or "").upper()
 
-        if has_supply and cur not in (ST_CARGO_PREP, ST_CARGO_CREATING, ST_POLL_CARGO, ST_LABELS_CREATING, ST_POLL_LABELS, ST_DONE):
-            target["status"] = ST_CARGO_PREP if AUTO_CREATE_CARGOES else ST_DONE
+        if has_supply and is_verified and cur not in (ST_CARGO_PREP, ST_CARGO_CREATING, ST_POLL_CARGO, ST_LABELS_CREATING, ST_POLL_LABELS, ST_DONE):
+            target["status"] = ST_CARGO_PREP
             target["next_attempt_ts"] = now_ts()
             target["retry_after_ts"] = 0
             target["retry_after_jitter"] = 0.0
@@ -507,16 +545,18 @@ def purge_tasks(days: int = SUPPLY_PURGE_AGE_DAYS) -> int:
     cutoff = now_ts() - int(days) * 86400
     before = len(_tasks)
     remain = []
+    removed_ids = []
     for t in _tasks:
         st = str(t.get("status") or "").upper()
-        if st in (ST_DONE, ST_FAILED, ST_CANCELED) and t.get("updated_ts", 0) < cutoff:
+        upd = int(t.get("updated_ts") or 0)
+        if st not in (ST_DONE, ST_FAILED, ST_CANCELED) and upd > 0 and upd < cutoff:
+            removed_ids.append(t.get("id"))
             continue
         remain.append(t)
     _tasks[:] = remain
     save_tasks()
-    removed = before - len(remain)
-    logging.info("purge_tasks: final-only mode days=%s removed=%s", days, removed)
-    return removed
+    logging.info("purge_stale_nonfinal: hours=%s removed=%s ids=%s", 48, before - len(remain), removed_ids[:10])
+    return before - len(remain)
 
 def purge_all_tasks() -> int:
     return purge_tasks(0)
@@ -543,22 +583,19 @@ def purge_stale_nonfinal(hours: int = 48) -> int:
 
 DASH_CLASS = r"[\-\u2010\u2011\u2012\u2013\u2014\u2015\u2212]"
 
-# Корректный паттерн заголовка "На DD.MM.YYYY, HH:MM-HH:MM"
 HEADER_RE = re.compile(
-    rf"\bНа\s+(\d{{2}})\.(\d{{2}})\.(\d{{4}}),\s*(\d{{2}}:\d{{2}})\s*{DASH_CLASS}\s*(\д{{2}}:\д{{2}})\b".replace("д", "d"),
+    rf"^\s*На\s+(\d{{2}})\.(\d{{2}})\.(\д{{4}})\s*,?\s*(\д{{2}}:\д{{2}})\s*{DASH_CLASS}\s*(\д{{2}}:\д{{2}})\s*$".replace("д", "d"),
     re.IGNORECASE
 )
 
 LINE_RE = re.compile(
     rf"""
     ^\s*
-    (?P<sku>.+?)\s*{DASH_CLASS}\s*
-    (?:количеств(?:о|а)|кол-?во|колво|qty|quantity)\s*
-    (?P<qty>\d+)\s*[,;]?\s*
+    (?P<sku>[^\s{DASH_CLASS}]+?)\s*{DASH_CLASS}\s*
+    (?:кол(?:-?\s*во|ичество)?|qty|quantity)\s*(?P<qty>\d+)\s*[,;]?\s*
     (?P<boxes>\d+)\s*
-    (?:короб(?:к(?:а|и|ок))?|кор\b|box(?:es)?)\s*[,;]?\s*
-    (?:в\s*каждой\s*коробке\s*по|по)\s*
-    (?P<per>\d+)\s*
+    (?:короб(?:к(?:а|и|ок))?|кор\.?\b|box(?:es)?)\s*[,;]?\s*
+    (?:в\s*каждой\s*коробке\s*по|по)\s*(?P<per>\d+)\s*
     (?:шт(?:\.|ук)?|штук|штуки|штука)?\s*[,;]?\s*
     (?P<wh>.+?)\s*\.?\s*$
     """,
@@ -576,7 +613,8 @@ def _canon_spaces_and_dashes(s: str) -> str:
     return s
 
 def _scan_header(lines: List[str]) -> Tuple[int, str, str, str]:
-    for idx, raw in enumerate(lines):
+    for idx, raw in enumerate(lines
+        ):
         line = _canon_spaces_and_dashes(raw)
         m = HEADER_RE.search(line)
         if m:
@@ -595,20 +633,26 @@ def _parse_item_line(raw_line: str) -> Optional[Dict[str, Any]]:
         per_box = int(m2.group("per"))
         wh = (m2.group("wh") or "").strip().rstrip(".")
         return {"sku": sku, "total_qty": qty, "boxes": boxes, "per_box": per_box, "warehouse_name": wh}
+
     parts = [p.strip() for p in re.split(rf"{DASH_CLASS}", line, maxsplit=1)]
     if len(parts) == 2:
         sku_guess, rest = parts[0].strip(), parts[1].strip()
-        m_qty = re.search(r"(?:количеств(?:о|а)|кол-?во|колво|qty|quantity)\s*(\d+)", rest, re.IGNORECASE)
-        m_boxes = re.search(r"(\d+)\s*(?:короб(?:к(?:а|и|ок))?|кор\b|box(?:es)?)", rest, re.IGNORECASE)
-        m_per = re.search(r"(?:в\s*каждой\s*коробке\s*по|по)\s*(\d+)", rest, re.IGNORECASE)
+        flags = re.IGNORECASE
+        m_qty = re.search(r"(?:кол(?:-?\s*во|ичество)?|qty|quantity)\s*(\d+)", rest, flags)
+        m_boxes = re.search(r"(\d+)\s*(?:короб(?:к(?:а|и|ок))?|кор\.?\b|box(?:es)?)", rest, flags)
+        m_per = re.search(r"(?:в\s*каждой\s*коробке\s*по|по)\s*(\d+)", rest, flags)
+        m_wh = re.search(r"(?:шт(?:\.|ук)?|штук|штуки|штука)[,;\s]*(.*)$", rest, flags)
         wh = None
-        if "," in rest or ";" in rest:
-            tail = re.split(r"[;,]", rest)
-            wh = tail[-1].strip().rstrip(".")
+        if m_wh and m_wh.group(1).strip():
+            wh = m_wh.group(1).strip().rstrip(".")
         else:
-            m_wh = re.search(r"(?:шт(?:\.|ук)?|штук|штуки|штука)\s*(.*)$", rest, re.IGNORECASE)
-            if m_wh:
-                wh = m_wh.group(1).strip().rstrip(".")
+            cut = re.split(r"[,;]", rest)
+            if len(cut) >= 2 and cut[-1].strip():
+                wh = cut[-1].strip().rstrip(".")
+            else:
+                tail = rest.split()
+                if tail:
+                    wh = tail[-1].strip().rstrip(".,;")
         if m_qty and m_boxes and m_per and wh:
             try:
                 qty = int(m_qty.group(1))
@@ -662,6 +706,23 @@ def _to_z_iso(iso_str: str) -> Optional[str]:
     except Exception:
         return None
 
+# === FIX: helpers for epoch conversion ===
+def _parse_iso_dt(s: Optional[str]) -> Optional[datetime]:
+    if not s:
+        return None
+    ss = s.strip()
+    if ss.endswith("Z"):
+        ss = ss[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(ss)
+    except Exception:
+        return None
+
+def _epoch(iso_str: Optional[str]) -> Optional[int]:
+    dt = _parse_iso_dt(iso_str)
+    return int(dt.timestamp()) if dt else None
+# =========================================
+
 def parse_pairs_or_json(raw: str) -> Dict[str, Any]:
     raw = (raw or "").strip()
     if not raw:
@@ -687,6 +748,15 @@ def parse_pairs_or_json(raw: str) -> Dict[str, Any]:
 
 WAREHOUSE_MAP = {str(k).lower(): v for k, v in parse_pairs_or_json(SUPPLY_WAREHOUSE_MAP_RAW).items()}
 
+REVERSE_WAREHOUSE_MAP: Dict[int, str] = {}
+for name_lc, val in WAREHOUSE_MAP.items():
+    try:
+        wid = int(val)
+        pretty = name_lc.strip() if name_lc else name_lc
+        REVERSE_WAREHOUSE_MAP[wid] = pretty
+    except Exception:
+        continue
+
 def resolve_warehouse_id(name: str) -> Optional[int]:
     lname = (name or "").lower()
     if lname in WAREHOUSE_MAP:
@@ -695,6 +765,31 @@ def resolve_warehouse_id(name: str) -> Optional[int]:
         except Exception:
             return None
     return None
+
+def warehouse_display(task: Dict[str, Any]) -> str:
+    try:
+        items = task.get("sku_list") or []
+        if items:
+            wn = (items[0] or {}).get("warehouse_name")
+            if wn:
+                wid = task.get("chosen_warehouse_id")
+                if wid:
+                    return f"{wn} (ID: {wid})"
+                return str(wn)
+    except Exception:
+        pass
+
+    wid = task.get("chosen_warehouse_id") or task.get("warehouse_id")
+    if wid:
+        try:
+            wid_int = int(wid)
+            nm = REVERSE_WAREHOUSE_MAP.get(wid_int)
+            if nm:
+                return f"{nm} (ID: {wid_int})"
+            return f"ID: {wid_int}"
+        except Exception:
+            return f"ID: {wid}"
+    return "—"
 
 def to_int_or_str(v: Any) -> Any:
     try:
@@ -712,10 +807,10 @@ def _extract_dropoff_id(task: Dict[str, Any]) -> Optional[int]:
                 pass
     return int(DROP_OFF_WAREHOUSE_ID) if DROP_OFF_WAREHOUSE_ID else None
 
-# ================== API calls ==================
+# ================== API calls (Ozon) ==================
 
 async def api_draft_create(api: OzonApi, task: Dict[str, Any]) -> Tuple[bool, Optional[str], Optional[str], int]:
-    items = [{"sku": to_int_or_str(line["sku"]), "quantity": int(line["total_qty"])} for line in task["sku_list"]]
+    items = [{"sku": str(line["sku"]), "quantity": int(line["total_qty"])} for line in task["sku_list"]]
     drop_id = _extract_dropoff_id(task)
     used_type = task.get("supply_type") or ("CREATE_TYPE_CROSSDOCK" if drop_id else SUPPLY_TYPE_DEFAULT)
     payload: Dict[str, Any] = {"items": items, "type": used_type}
@@ -733,7 +828,6 @@ async def api_draft_create(api: OzonApi, task: Dict[str, Any]) -> Tuple[bool, Op
     task["supply_type"] = used_type
     update_task(task)
 
-    # «Тихий коридор» перед create
     try:
         await _enter_quiet_before_create()
     except Exception:
@@ -752,7 +846,6 @@ async def api_draft_create(api: OzonApi, task: Dict[str, Any]) -> Tuple[bool, Op
         except Exception:
             base = ON429_SHORT_RETRY_SEC
 
-        # При пер‑секундном лимите — длиннее пауза, чтобы выйти из окна
         if "per second" in msg or "per-second" in msg or "per second limit" in msg:
             wait_sec = max(base + 10, 30) + random.randint(0, 15)
         else:
@@ -762,8 +855,6 @@ async def api_draft_create(api: OzonApi, task: Dict[str, Any]) -> Tuple[bool, Op
 
         _set_retry_after(task, wait_sec, jitter_max=1.5)
         task["last_error"] = "429 Too Many Requests (draft/create)"
-        task["create_attempts"] = int(task.get("create_attempts") or 0) + 1
-        # Сохраним trace id для обращения в поддержку
         try:
             task["last_trace_id"] = headers.get("x-o3-trace-id", "")
         except Exception:
@@ -828,6 +919,58 @@ def choose_warehouse(warehouses: List[Dict[str, Any]]) -> Optional[int]:
     pick = (avail[0] if avail else normalized[0])
     return int(pick["warehouse_id"]) if pick and pick.get("warehouse_id") is not None else None
 
+def _tokens(s: str) -> List[str]:
+    s = (s or "").lower()
+    s = re.sub(r"[^a-zа-я0-9\s\-]+", " ", s, flags=re.IGNORECASE)
+    s = s.replace("_", " ").replace("-", " ")
+    return [t for t in s.split() if t]
+
+def _name_match_score(desired: str, candidate: str) -> int:
+    dt = set(_tokens(desired))
+    ct = set(_tokens(candidate))
+    if not dt or not ct:
+        return 0
+    return len(dt & ct)
+
+def choose_warehouse_smart(task: Dict[str, Any], warehouses: List[Dict[str, Any]]) -> Optional[int]:
+    pre = task.get("chosen_warehouse_id")
+    if pre:
+        try:
+            pre_i = int(pre)
+        except Exception:
+            pre_i = None
+        if pre_i:
+            for w in (warehouses or []):
+                try:
+                    wid = int((w.get("supply_warehouse") or {}).get("warehouse_id") or w.get("warehouse_id") or 0)
+                except Exception:
+                    wid = 0
+                if wid == pre_i:
+                    return pre_i
+    desired_name = ""
+    try:
+        desired_name = ((task.get("sku_list") or [{}])[0]).get("warehouse_name") or ""
+    except Exception:
+        desired_name = ""
+    best = None
+    best_score = -1
+    for w in (warehouses or []):
+        wid = None
+        name = ""
+        try:
+            wid = int((w.get("supply_warehouse") or {}).get("warehouse_id") or w.get("warehouse_id") or 0)
+        except Exception:
+            wid = None
+        name = (w.get("supply_warehouse") or {}).get("name") or w.get("name") or ""
+        if wid:
+            sc = _name_match_score(desired_name, name)
+            if sc > best_score and _is_available(w):
+                best = wid
+                best_score = sc
+    if best:
+        return best
+    return choose_warehouse(warehouses)
+
 async def api_draft_create_info(api: OzonApi, operation_id: str) -> Tuple[bool, Optional[str], List[Dict[str, Any]], Optional[str], int]:
     payload = {"operation_id": operation_id}
     ok, data, err, status, headers = await api.post("/v1/draft/create/info", payload)
@@ -838,7 +981,7 @@ async def api_draft_create_info(api: OzonApi, operation_id: str) -> Tuple[bool, 
         return False, None, [], f"draft_info_error:{err}|{data}", status
     draft_id = data.get("draft_id") or data.get("result", {}).get("draft_id")
     if not draft_id:
-        s = (data.get("status") or data.get("result") or {}).get("status") or ""
+        s = (data.get("status") or (data.get("result") or {}).get("status") or "")
         if str(s).upper() in ("IN_PROGRESS", "PENDING", ""):
             return False, None, [], None, status
         return False, None, [], f"draft_info_no_draft_id:{data}", status
@@ -863,10 +1006,13 @@ def _normalize_timeslots_response(js: Dict[str, Any]) -> List[Dict[str, Any]]:
                 slot.setdefault("from_in_timezone", fr_loc)
             if to_loc:
                 slot.setdefault("to_in_timezone", to_loc)
+            slot["from_epoch"] = _epoch(slot.get("from_in_timezone"))
+            slot["to_epoch"] = _epoch(slot.get("to_in_timezone"))
             out.append(slot)
     drop = js.get("drop_off_warehouse_timeslots") or js.get("result", {}).get("drop_off_warehouse_timeslots") or []
     if isinstance(drop, list):
         for entry in drop:
+            drop_id = entry.get("drop_off_warehouse_id")
             days = (entry or {}).get("days") or []
             for day in days:
                 tss = (day or {}).get("timeslots") or []
@@ -878,70 +1024,94 @@ def _normalize_timeslots_response(js: Dict[str, Any]) -> List[Dict[str, Any]]:
                     fr_loc = to_local_iso(fr) if fr else None
                     to_loc = to_local_iso(to) if to else None
                     slot = dict(s)
-                    slot.setdefault("capacity_status", "")
                     if fr_loc:
                         slot["from_in_timezone"] = fr_loc
                     if to_loc:
                         slot["to_in_timezone"] = to_loc
+                    slot["from_epoch"] = _epoch(slot.get("from_in_timezone"))
+                    slot["to_epoch"] = _epoch(slot.get("to_in_timezone"))
+                    if drop_id is not None:
+                        slot.setdefault("drop_off_point_warehouse_id", drop_id)
                     out.append(slot)
     return out
 
 async def api_timeslot_info(api: OzonApi, draft_id: str, warehouse_ids: List[int], date_iso: str, bundle_id: Optional[str] = None) -> Tuple[bool, List[Dict[str, Any]], str, int]:
-    def _make_payloads(draft_id: str, wids: List[int], from_iso: str, to_iso: str, bundle_id: Optional[str]) -> List[Tuple[str, Dict[str, Any]]]:
-        endpoints = ["/v1/draft/timeslot/info", "/v2/draft/timeslot/info"]
-        base = {"draft_id": draft_id, "warehouse_ids": [int(w) for w in wids]}
-        pl_variants: List[Dict[str, Any]] = [
-            dict(base, date_from=from_iso, date_to=to_iso),
-            dict(base, from_in_timezone=from_iso, to_in_timezone=to_iso),
-        ]
+    def _build_payload(draft_id: str, wids: List[int], from_z: str, to_z: str, bundle_id: Optional[str]) -> Dict[str, Any]:
+        base = {
+            "draft_id": draft_id,
+            "warehouse_ids": [int(w) for w in wids],
+            "date_from": from_z,
+            "date_to": to_z
+        }
         if bundle_id:
-            pl_variants += [
-                dict(base, date_from=from_iso, date_to=to_iso, bundle_id=bundle_id),
-                dict(base, from_in_timezone=from_iso, to_in_timezone=to_iso, bundle_id=bundle_id),
-            ]
-        payloads: List[Tuple[str, Dict[str, Any]]] = []
-        for ep in endpoints:
-            for pl in pl_variants:
-                payloads.append((ep, pl))
-        return payloads
+            base["bundle_id"] = bundle_id
+        if DROP_OFF_WAREHOUSE_ID:
+            base.setdefault("drop_off_point_warehouse_id", int(DROP_OFF_WAREHOUSE_ID))
+        return base
 
     day_start_local, day_end_local = day_range_local(date_iso)
+    from_z = _to_z_iso(day_start_local) or day_start_local
+    to_z = _to_z_iso(day_end_local) or day_end_local
+
+    pl = _build_payload(draft_id, warehouse_ids, from_z, to_z, bundle_id)
+    ok, data, err, status, headers = await api.post("/v1/draft/timeslot/info", pl)
+    logging.info("timeslot_info(v1): status=%s keys=%s", status, list(pl.keys()))
+    if status == 429:
+        ra = _parse_retry_after(headers)
+        return False, [], f"rate_limit:{min(RATE_LIMIT_MAX_ON429, max(ON429_SHORT_RETRY_SEC, ra))}", status
+    if status == 404:
+        return False, [], "not_found_404", 404
+    if ok:
+        slots = _normalize_timeslots_response(data)
+        if slots:
+            return True, slots, "", status
+        return False, [], "", status
+
+    last_err = f"timeslot_info_error:{err}|{data}"
+    last_status = status
+
     extra_days = max(0, int(SUPPLY_TIMESLOT_SEARCH_EXTRA_DAYS))
-    ext_to_local = day_range_local(add_days_iso(date_iso, extra_days))[1] if extra_days > 0 else day_end_local
-
-    last_err = ""
-    last_status = 0
-
-    for ep, pl in _make_payloads(draft_id, warehouse_ids, day_start_local, day_end_local, bundle_id):
-        ok, data, err, status, headers = await api.post(ep, pl)
-        logging.info("timeslot_info: ep=%s status=%s keys=%s", ep, status, list(pl.keys()))
-        if status == 429:
-            ra = _parse_retry_after(headers)
-            return False, [], f"rate_limit:{min(RATE_LIMIT_MAX_ON429, max(ON429_SHORT_RETRY_SEC, ra))}", status
-        if ok:
-            slots = _normalize_timeslots_response(data)
-            if slots:
-                return True, slots, "", status
-        else:
-            last_err = f"timeslot_info_error:{err}|{data}"
-            last_status = status
-
     if extra_days > 0:
-        for ep, pl in _make_payloads(draft_id, warehouse_ids, day_start_local, ext_to_local, bundle_id):
-            ok, data, err, status, headers = await api.post(ep, pl)
-            logging.info("timeslot_info(ext): ep=%s status=%s keys=%s", ep, status, list(pl.keys()))
-            if status == 429:
-                ra = _parse_retry_after(headers)
-                return False, [], f"rate_limit:{min(RATE_LIMIT_MAX_ON429, max(ON429_SHORT_RETRY_SEC, ra))}", status
-            if ok:
-                slots = _normalize_timeslots_response(data)
-                if slots:
-                    return True, slots, "", status
-            else:
-                last_err = f"timeslot_info_error:{err}|{data}"
-                last_status = status
+        ext_to_local = day_range_local(add_days_iso(date_iso, extra_days))[1]
+        ext_to_z = _to_z_iso(ext_to_local) or ext_to_local
+        pl2 = _build_payload(draft_id, warehouse_ids, from_z, ext_to_z, bundle_id)
+        ok2, data2, err2, status2, headers2 = await api.post("/v1/draft/timeslot/info", pl2)
+        logging.info("timeslot_info(v1,ext): status=%s keys=%s", status2, list(pl2.keys()))
+        if status2 == 429:
+            ra = _parse_retry_after(headers2)
+            return False, [], f"rate_limit:{min(RATE_LIMIT_MAX_ON429, max(ON429_SHORT_RETRY_SEC, ra))}", status2
+        if status2 == 404:
+            return False, [], "not_found_404", 404
+        if ok2:
+            slots2 = _normalize_timeslots_response(data2)
+            if slots2:
+                return True, slots2, "", status2
+        else:
+            last_err = f"timeslot_info_error:{err2}|{data2}"
+            last_status = status2
 
     return False, [], (last_err or "timeslot_info_empty"), (last_status or 200)
+
+async def api_draft_timeslot_set(
+    api: OzonApi,
+    draft_id: int,
+    drop_off_point_warehouse_id: int,
+    timeslot: Dict[str, Any],
+) -> Tuple[bool, Optional[str], int]:
+    body = {
+        "id": int(draft_id),
+        "drop_off_point_warehouse_id": int(drop_off_point_warehouse_id),
+        "timeslot": dict(timeslot),
+    }
+    ok, data, err, status, headers = await api.post("/v1/draft/timeslot/set", body)
+    if status == 429:
+        ra = _parse_retry_after(headers)
+        return False, f"rate_limit:{min(RATE_LIMIT_MAX_ON429, max(ON429_SHORT_RETRY_SEC, ra))}", status
+    if status == 404:
+        return False, "not_found_404", 404
+    if not ok:
+        return False, f"http_status:{status}", status
+    return True, None, status
 
 def _drop_id_from_task(task: Dict[str, Any]) -> Optional[int]:
     for k in ("dropoff_warehouse_id", "drop_off_point_warehouse_id", "drop_off_id"):
@@ -957,6 +1127,11 @@ async def api_supply_create(api: OzonApi, task: Dict[str, Any]) -> Tuple[bool, O
     if api.mock:
         return True, f"op-supply-{short(task['id'])}", None, 200
 
+    try:
+        await _enter_quiet_before_create()
+    except Exception:
+        pass
+
     draft_id = task["draft_id"]
     wid = int(task.get("chosen_warehouse_id") or 0)
     fr = task["desired_from_iso"]
@@ -970,7 +1145,6 @@ async def api_supply_create(api: OzonApi, task: Dict[str, Any]) -> Tuple[bool, O
 
     base = {"draft_id": draft_id, "from_in_timezone": fr, "to_in_timezone": to}
     variants: List[Dict[str, Any]] = []
-
     variants.append(dict(base, warehouse_id=wid))
     if drop_id:
         variants.append(dict(base, warehouse_id=wid, drop_off_point_warehouse_id=int(drop_id)))
@@ -993,9 +1167,11 @@ async def api_supply_create(api: OzonApi, task: Dict[str, Any]) -> Tuple[bool, O
     last_status: int = 400
 
     for pl in uniq:
+        task["last_supply_http_attempt_ts"] = now_ts()
+        update_task(task)
+
         ok, data, err, status, headers = await api.post("/v1/draft/supply/create", pl)
         logging.info("supply_create: status=%s keys=%s", status, list(pl.keys()))
-
         if status == 429 or (err and str(err).startswith("rate_limit:")):
             try:
                 ra = int(str(err).split(":", 1)[1]) if err else ON429_SHORT_RETRY_SEC
@@ -1029,10 +1205,7 @@ async def api_supply_create_status(api: OzonApi, operation_id: str) -> Tuple[boo
         return False, None, f"rate_limit:{min(RATE_LIMIT_MAX_ON429, max(ON429_SHORT_RETRY_SEC, ra))}", status
     if not ok:
         return False, None, f"supply_status_error:{err}|{data}", status
-
-    raw_status = str(data.get("status") or (data.get("result") or {}).get("status") or "").strip()
-    s_norm = raw_status.lower()
-
+    raw_status = str(data.get("status") or (data.get("result") or {}).get("status") or "").lower()
     def _extract_order_id_from_supply_status(data: Dict[str, Any]) -> Optional[str]:
         direct = data.get("order_id")
         if direct not in (None, "", []):
@@ -1060,15 +1233,13 @@ async def api_supply_create_status(api: OzonApi, operation_id: str) -> Tuple[boo
             except Exception:
                 return str(res_arr[0])
         return None
-
     order_id = _extract_order_id_from_supply_status(data)
-    if "success" in s_norm or (order_id and not s_norm):
+    if "success" in raw_status or order_id:
         if not order_id:
             return False, None, f"supply_status_no_order_id:{data}", status
         return True, order_id, None, status
-    if "progress" in s_norm or s_norm in ("in_progress", "pending", "processing"):
+    if "progress" in raw_status or raw_status in ("in_progress", "pending", "processing", ""):
         return False, None, None, status
-
     errors = data.get("error_messages") or (data.get("result") or {}).get("error_messages") or []
     if errors:
         return False, None, f"supply_status_error_messages:{errors}", status
@@ -1076,43 +1247,47 @@ async def api_supply_create_status(api: OzonApi, operation_id: str) -> Tuple[boo
         return True, order_id, None, status
     return False, None, f"supply_status_unrecognized:{raw_status}", status
 
+def _first_str_in(o: Dict[str, Any], keys: List[str]) -> Optional[str]:
+    for k in keys:
+        v = o.get(k)
+        if isinstance(v, str) and v:
+            return v
+        if isinstance(v, int):
+            return str(v)
+    return None
+
+def _deep_find_supply_id(obj: Any) -> Optional[str]:
+    try:
+        def walk(o: Any) -> Optional[str]:
+            if isinstance(o, dict):
+                for k, v in o.items():
+                    kl = str(k).lower()
+                    if "supply" in kl and "id" in kl:
+                        if isinstance(v, bool):
+                            pass
+                        elif isinstance(v, int) and v > 0:
+                            return str(v)
+                        elif isinstance(v, str) and v.strip() and v.strip().isdigit():
+                            return v.strip()
+                    r = walk(v)
+                    if r:
+                        return r
+            elif isinstance(o, list):
+                for it in o:
+                    r = walk(it)
+                    if r:
+                        return r
+            return None
+        return walk(obj)
+    except Exception:
+        return None
+
 def _extract_supply_order_info_from_response(js: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
-    def _first_str(o: Dict[str, Any], keys: List[str]) -> Optional[str]:
-        for k in keys:
-            v = o.get(k)
-            if isinstance(v, str) and v:
-                return v
-            if isinstance(v, int):
-                s = str(v)
-                if s:
-                    return s
-        return None
-
-    def _first_supply_like_id(o: Dict[str, Any]) -> Optional[str]:
-        for k in ("supply_id", "supplyId"):
-            v = o.get(k)
-            if v not in (None, "", []):
-                return str(v)
-        for k in ("supply_order_id", "supplyOrderId"):
-            v = o.get(k)
-            if v not in (None, "", []):
-                return str(v)
-        for k in ("supply", "supply_order", "supplyOrder"):
-            v = o.get(k)
-            if isinstance(v, dict):
-                for kk in ("id", "supply_id", "supplyId", "supply_order_id", "supplyOrderId"):
-                    vv = v.get(kk)
-                    if vv not in (None, "", []):
-                        return str(vv)
-        return None
-
     for scope in [js, js.get("result") or {}]:
         if isinstance(scope, dict):
-            sid = _first_supply_like_id(scope)
-            num = _first_str(scope, ["supply_order_number", "supplyOrderNumber", "order_number", "orderNumber", "number"])
-            if sid or num:
-                return sid, num
-
+            sid = scope.get("supply_id")
+            if sid not in (None, "", []):
+                return str(sid), _first_str_in(scope, ["supply_order_number", "order_number", "number"])
     list_keys = ["orders", "supply_orders", "supplyOrders", "items", "data", "order_list", "supply_orders_list"]
     for scope in [js, js.get("result") or {}]:
         if not isinstance(scope, dict):
@@ -1120,12 +1295,27 @@ def _extract_supply_order_info_from_response(js: Dict[str, Any]) -> Tuple[Option
         for lk in list_keys:
             arr = scope.get(lk)
             if isinstance(arr, list) and arr:
-                first = arr[0]
-                if isinstance(first, dict):
-                    sid = _first_supply_like_id(first)
-                    num = _first_str(first, ["supply_order_number", "supplyOrderNumber", "order_number", "orderNumber", "number"])
-                    if sid or num:
-                        return sid, num
+                first = arr[0] if isinstance(arr[0], dict) else None
+                if not isinstance(first, dict):
+                    continue
+                supplies = first.get("supplies") or []
+                if isinstance(supplies, list):
+                    for s in supplies:
+                        if isinstance(s, dict) and s.get("supply_id") not in (None, "", 0):
+                            sid = str(s.get("supply_id"))
+                            num = _first_str_in(first, ["supply_order_number", "order_number", "number"])
+                            return sid, num
+                direct_sid = first.get("supply_id")
+                if direct_sid not in (None, "", 0):
+                    sid = str(direct_sid)
+                    num = _first_str_in(first, ["supply_order_number", "order_number", "number"])
+                    return sid, num
+                num = _first_str_in(first, ["supply_order_number", "order_number", "number"])
+                if num:
+                    return None, num
+    deep_sid = _deep_find_supply_id(js)
+    if deep_sid:
+        return deep_sid, _first_str_in(js.get("result") or {}, ["supply_order_number", "order_number", "number"])
     return None, None
 
 def _extract_order_meta(js: Dict[str, Any]) -> Dict[str, Any]:
@@ -1199,8 +1389,8 @@ async def api_supply_order_get(api: OzonApi, order_id: str) -> Tuple[bool, Optio
         if ok:
             sid, num = _extract_supply_order_info_from_response(data)
             meta = _extract_order_meta(data)
-            if sid or num:
-                return True, sid, (num or ""), None, status, meta
+            return True, sid, (num or ""), None, status, meta
+        last_err, last_status = f"supply_order_get_error:{err}|{data}", status
 
     for pl in payloads_v1:
         ok, data, err, status, headers = await api.post("/v1/supply-order/get", pl)
@@ -1217,147 +1407,168 @@ async def api_supply_order_get(api: OzonApi, order_id: str) -> Tuple[bool, Optio
 
 async def api_supply_order_timeslot_set(
     api: OzonApi,
-    order_id: Any,
-    from_iso: str,
-    to_iso: str,
+    order_id: str,
+    from_in_timezone: str,
+    to_in_timezone: str,
     slot_id: Optional[Any] = None,
     dropoff_warehouse_id: Optional[int] = None,
-    supply_id: Optional[Any] = None,
-    warehouse_id: Optional[int] = None,
-) -> Tuple[bool, Optional[str], int]:
-    def _num_or_str(x: Any) -> Any:
-        try:
-            return int(str(x).strip())
-        except Exception:
-            return str(x).strip()
+    supply_id: Optional[str] = None,
+    chosen_warehouse_id: Optional[int] = None,
+) -> Tuple[bool, Optional[str], int, Optional[str]]:
+    try:
+        oid = int(str(order_id))
+    except Exception:
+        oid = int(order_id)
 
-    oid = _num_or_str(order_id)
-    wid = int(warehouse_id) if warehouse_id not in (None, "", 0, "0") else None
-    drop = int(dropoff_warehouse_id) if dropoff_warehouse_id not in (None, "", 0, "0") else None
+    variants: List[Dict[str, Any]] = []
 
-    id_variants: List[Dict[str, Any]] = [{"order_id": oid}, {"supply_order_id": oid}, {"id": oid}]
-    z_from, z_to = _to_z_iso(from_iso), _to_z_iso(to_iso)
+    v1 = {"supply_order_id": oid, "from_in_timezone": from_in_timezone, "to_in_timezone": to_in_timezone}
+    if slot_id:
+        v1["timeslot_id"] = slot_id
+    variants.append(v1)
 
-    base_ts_variants = [
-        {"from_in_timezone": from_iso, "to_in_timezone": to_iso},
-        {"from": z_from or from_iso, "to": z_to or to_iso},
-    ]
-    if slot_id is not None:
-        base_ts_variants.append({"id": slot_id})
+    v2 = {"supply_order_id": oid, "timeslot": {"from": from_in_timezone, "to": to_in_timezone}}
+    variants.append(v2)
 
-    def _with_optional(p: Dict[str, Any]) -> List[Dict[str, Any]]:
-        variants = [dict(p)]
-        if drop:
-            variants.append(dict(p, drop_off_point_warehouse_id=drop))
-        if wid:
-            variants.append(dict(p, warehouse_id=wid))
-        if drop and wid:
-            variants.append(dict(p, drop_off_point_warehouse_id=drop, warehouse_id=wid))
-        return variants
+    v3 = {"order_id": oid, "from_in_timezone": from_in_timezone, "to_in_timezone": to_in_timezone}
+    if slot_id:
+        v3["timeslot_id"] = slot_id
+    variants.append(v3)
 
-    attempts: List[Tuple[str, str, Dict[str, Any], str]] = []
+    v4 = {"order_id": oid, "timeslot": {"from": from_in_timezone, "to": to_in_timezone}}
+    variants.append(v4)
 
-    for idv in id_variants:
-        for ts in base_ts_variants:
-            upd = {"update": {"timeslot": dict(ts)}}
-            for pl in _with_optional(dict(idv, **upd)):
-                attempts.append(("/v2/supply-order/update", "update.timeslot", pl, "POST"))
-                attempts.append(("/v1/supply-order/update", "update.timeslot", pl, "POST"))
-            flat = {"timeslot": dict(ts)}
-            for pl in _with_optional(dict(idv, **flat)):
-                attempts.append(("/v2/supply-order/update", "flat.timeslot", pl, "POST"))
-                attempts.append(("/v1/supply-order/update", "flat.timeslot", pl, "POST"))
+    last_err = None
+    last_status = 400
 
-    for idv in id_variants:
-        for ts in base_ts_variants:
-            flat = {"timeslot": dict(ts)}
-            for pl in _with_optional(dict(idv, **flat)):
-                for ep in ("/v2/supply-order/set-timeslot", "/v1/supply-order/set-timeslot"):
-                    for m in ("POST", "PUT", "PATCH"):
-                        attempts.append((ep, "set-timeslot.flat", pl, m))
-            if "id" in ts:
-                for pl in _with_optional(dict(idv, timeslot_id=ts["id"])):
-                    for ep in ("/v2/supply-order/set-timeslot", "/v1/supply-order/set-timeslot"):
-                        for m in ("POST", "PUT", "PATCH"):
-                            attempts.append((ep, "set-timeslot.id", pl, m))
-
-    for idv in id_variants:
-        for ts in base_ts_variants:
-            flat = {"timeslot": dict(ts)}
-            for pl in _with_optional(dict(idv, **flat)):
-                for ep in ("/v2/supply-order/timeslot/set", "/v1/supply-order/timeslot/set"):
-                    for m in ("POST", "PUT", "PATCH"):
-                        attempts.append((ep, "timeslot.set.flat", pl, m))
-
-    errors: List[str] = []
-    saw_404 = False
-    saw_429 = False
-    saw_ok = False
-    saw_other = False
-
-    for ep, tag, pl, method in attempts:
-        logging.info("timeslot_set: %s %s payload_keys=%s", method, ep, list(pl.keys()))
-        ok, data, err, status, headers = await api.request(method, ep, pl)
-
-        body_snip = ""
-        try:
-            body_snip = (data.get("text") if isinstance(data, dict) else str(data))[:160]
-        except Exception:
-            pass
-
+    for body in variants:
+        ok, data, err, status, headers = await api.post("/v1/supply-order/timeslot/update", body)
         if status == 404:
-            saw_404 = True
-            errors.append(f"{method} {ep} 404:{body_snip}")
-            continue
+            return False, "not_supported_404", 404, None
         if status == 429:
-            saw_429 = True
             ra = _parse_retry_after(headers)
-            errors.append(f"{method} {ep} 429:rate_limit:{ra}")
-            continue
+            return False, f"rate_limit:{ra}", 429, None
 
-        if ok:
-            saw_ok = True
-            return True, None, status
+        if 200 <= status < 300 and ok:
+            op_id = None
+            try:
+                op_id = (data or {}).get("operation_id") or (data or {}).get("result", {}).get("operation_id")
+            except Exception:
+                op_id = None
+            return True, None, status, (str(op_id) if op_id else None)
 
-        saw_other = True
-        errors.append(f"{method} {ep} {status}:{body_snip}")
+        last_err, last_status = (err or f"http_status:{status}"), status
 
-    if (saw_404 or saw_429) and not saw_ok and not saw_other:
-        logging.warning("timeslot_set: not_supported_404/429 only — пропускаем установку тайм-слота.")
-        return False, "not_supported_404", 404
+    return False, (last_err or "http_status:400"), last_status, None
 
-    msg = "timeslot_set_failed:all_endpoints_rejected_or_missing"
-    logging.error("timeslot_set: %s; attempts:\n%s", msg, "\n\n".join(errors))
-    return False, msg, 400
+async def api_operation_get(api: OzonApi, operation_id: str) -> Tuple[bool, Optional[str], Optional[str], int]:
+    payload = {"operation_id": operation_id}
+    ok, data, err, status, headers = await api.post("/v1/operation/get", payload)
+    if status == 429:
+        ra = _parse_retry_after(headers)
+        return False, None, f"rate_limit:{min(RATE_LIMIT_MAX_ON429, max(ON429_SHORT_RETRY_SEC, ra))}", status
+    if not ok:
+        return False, None, f"operation_get_error:{err}|{data}", status
+    s = (data.get("status") or (data.get("result") or {}).get("status") or "").upper()
+    return True, s or "", None, status
 
-async def api_cargoes_create(api: OzonApi, payload: Dict[str, Any]) -> Tuple[bool, Optional[str], Optional[str], int]:
+def _canon_cargo_type(raw: Any) -> str:
+    v = str(raw or "").strip().upper()
+    return v if v in ("BOX", "PALLET") else "BOX"
+
+def _build_cargoes_v1_payload(task: Dict[str, Any]) -> Dict[str, Any]:
+    supply_id_raw = task.get("supply_id")
+    if not supply_id_raw:
+        raise RuntimeError("supply_id is missing; wait for /v2/supply-order/get -> orders.supplies.supply_id")
+    try:
+        supply_id = int(str(supply_id_raw).strip())
+    except Exception:
+        raise RuntimeError("supply_id must be int64-compatible")
+
+    ctype = _canon_cargo_type(task.get("type") or task.get("cargo_type") or "BOX")
+    cargoes: List[Dict[str, Any]] = []
+
+    for line in task["sku_list"]:
+        offer_id = str(line.get("sku"))
+        boxes = int(line["boxes"])
+        per_box = int(line["per_box"])
+
+        for _ in range(boxes):
+            item = {"offer_id": offer_id, "quant": per_box, "quantity": per_box}
+            value = {"type": ctype, "items": [item]}
+            cargoes.append({"key": str(uuid.uuid4()), "value": value})
+
+    body = {"supply_id": supply_id, "delete_current_version": True, "cargoes": cargoes}
+    return body
+
+async def api_cargoes_create_v1(api: OzonApi, payload: Dict[str, Any]) -> Tuple[bool, Optional[str], Optional[str], int]:
     ok, data, err, status, headers = await api.post("/v1/cargoes/create", payload)
     if status == 429:
         ra = _parse_retry_after(headers)
         return False, None, f"rate_limit:{min(RATE_LIMIT_MAX_ON429, max(ON429_SHORT_RETRY_SEC, ra))}", status
     if not ok:
-        return False, None, f"cargoes_create_error:{err}|{data}", status
+        return False, None, f"cargoes_create_v1_error:{err}|{data}", status
     op_id = data.get("operation_id") or data.get("result", {}).get("operation_id")
     if not op_id:
-        return False, None, f"cargoes_create_no_operation_id:{data}", status
+        return False, None, f"cargoes_create_v1_no_operation_id:{data}", status
     return True, op_id, None, status
 
-async def api_cargoes_create_info(api: OzonApi, operation_id: str) -> Tuple[bool, List[Dict[str, Any]], Optional[str], int]:
+async def api_cargoes_create_info_v2(api: OzonApi, operation_id: str) -> Tuple[bool, List[Dict[str, Any]], Optional[str], int]:
+    payload = {"operation_id": operation_id}
+    ok, data, err, status, headers = await api.post("/v2/cargoes/create/info", payload)
+    if status == 429:
+        ra = _parse_retry_after(headers)
+        return False, [], f"rate_limit:{min(RATE_LIMIT_MAX_ON429, max(ON429_SHORT_RETRY_SEC, ra))}", status
+    if not ok:
+        return False, [], f"cargoes_info_v2_error:{err}|{data}", status
+
+    raw_status = str(data.get("status") or (data.get("result") or {}).get("status") or "").upper()
+    if raw_status in ("", "STATUS_IN_PROGRESS", "IN_PROGRESS", "PENDING"):
+        return False, [], None, status
+
+    if raw_status == "FAILED":
+        try:
+            reason_json = json.dumps(data, ensure_ascii=False)
+        except Exception:
+            reason_json = str(data)
+        return False, [], f"cargoes_failed:{reason_json}", status
+
+    cargo_ids: List[str] = []
+    try:
+        result = data.get("result") or {}
+        arr = result.get("cargoes") or []
+        if isinstance(arr, list):
+            for entry in arr:
+                if not isinstance(entry, dict):
+                    continue
+                val = entry.get("value") or {}
+                cid = val.get("cargo_id")
+                if cid not in (None, "", 0):
+                    cargo_ids.append(str(cid))
+    except Exception:
+        pass
+
+    if cargo_ids:
+        return True, [{"cargo_id": cid} for cid in cargo_ids], None, status
+
+    return False, [], f"cargoes_info_v2_no_cargoes:{data}", status
+
+async def api_cargoes_create_info_v1(api: OzonApi, operation_id: str) -> Tuple[bool, List[Dict[str, Any]], Optional[str], int]:
     payload = {"operation_id": operation_id}
     ok, data, err, status, headers = await api.post("/v1/cargoes/create/info", payload)
     if status == 429:
         ra = _parse_retry_after(headers)
         return False, [], f"rate_limit:{min(RATE_LIMIT_MAX_ON429, max(ON429_SHORT_RETRY_SEC, ra))}", status
     if not ok:
-        return False, [], f"cargoes_info_error:{err}|{data}", status
-    s = (data.get("status") or data.get("result") or {}).get("status", "").upper()
+        return False, [], f"cargoes_info_v1_error:{err}|{data}", status
+    s = (data.get("status") or (data.get("result") or {}).get("status") or "").upper()
     if s in ("IN_PROGRESS", "PENDING", ""):
         return False, [], None, status
     if s not in ("SUCCESS", "OK", "DONE"):
         return False, [], f"cargoes_status_fail:{s}|{data}", status
     cargoes = data.get("cargoes") or data.get("result", {}).get("cargoes") or []
     if not cargoes:
-        return False, [], f"cargoes_info_no_cargoes:{data}", status
+        return False, [], f"cargoes_info_v1_no_cargoes:{data}", status
     return True, cargoes, None, status
 
 async def api_labels_create(api: OzonApi, supply_id: str, cargo_ids: Optional[List[str]] = None) -> Tuple[bool, Optional[str], Optional[str], int]:
@@ -1383,7 +1594,7 @@ async def api_labels_get(api: OzonApi, operation_id: str) -> Tuple[bool, Optiona
         return False, None, f"rate_limit:{min(RATE_LIMIT_MAX_ON429, max(ON429_SHORT_RETRY_SEC, ra))}", status
     if not ok:
         return False, None, f"labels_get_error:{err}|{data}", status
-    s = (data.get("status") or data.get("result") or {}).get("status", "").upper()
+    s = (data.get("status") or (data.get("result") or {}).get("status") or "").upper()
     if s in ("IN_PROGRESS", "PENDING", ""):
         return False, None, None, status
     if s not in ("SUCCESS", "OK", "DONE"):
@@ -1399,31 +1610,140 @@ async def api_labels_file(api: OzonApi, file_guid: str) -> Tuple[bool, Optional[
         return False, None, err
     return True, content, None
 
-# ================== Timeslot helpers inside order ==================
+# ================== Draft cooldown files ==================
+
+_DRAFT_RATE_LOCK = threading.RLock()
+_DRAFT_RATE_FILE = DATA_DIR / ".draft_create_next_allowed"
+_DRAFT_COOLDOWN_FILE = DATA_DIR / ".draft_create_cooldown_until"
+_DRAFT_RATE_LOCKFILE = DATA_DIR / ".draft_create_next_allowed.lock"
+
+def _read_int_from_file(p: Path) -> int:
+    try:
+        s = p.read_text(encoding="utf-8").strip()
+        return int(s) if s else 0
+    except Exception:
+        return 0
+
+def _write_int_to_file(p: Path, v: int):
+    try:
+        p.write_text(str(int(v)), encoding="utf-8")
+    except Exception:
+        pass
+
+@contextmanager
+def _interprocess_lock(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(str(path), "a+b") as f:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        try:
+            yield f
+        finally:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+def _read_next_allowed_ts() -> int:
+    return _read_int_from_file(_DRAFT_RATE_FILE)
+
+def _write_next_allowed_ts(ts: int):
+    _write_int_to_file(_DRAFT_RATE_FILE, ts)
+
+def _read_draft_cooldown_until() -> int:
+    return _read_int_from_file(_DRAFT_COOLDOWN_FILE)
+
+def _write_draft_cooldown_until(ts: int):
+    _write_int_to_file(_DRAFT_COOLDOWN_FILE, ts)
+
+def _reserve_draft_slot_or_wait() -> int:
+    with _interprocess_lock(_DRAFT_RATE_LOCKFILE):
+        with _DRAFT_RATE_LOCK:
+            n = now_ts()
+            next_allowed = _read_next_allowed_ts()
+            if n < next_allowed:
+                return max(1, next_allowed - n)
+            _write_next_allowed_ts(n + DRAFT_CREATE_MIN_SPACING_SECONDS)
+            return 0
+
+def _draft_global_wait() -> int:
+    n = now_ts()
+    until = _read_draft_cooldown_until()
+    if until > n:
+        return until - n
+    return 0
+
+def _set_global_draft_cooldown(base_wait: float):
+    sec = int(max(1.0, float(base_wait) + random.uniform(0.2, 1.1)))
+    until = now_ts() + sec
+    _write_draft_cooldown_until(until)
+    logging.info("draft cooldown set: %ss (until=%s)", sec, until)
+
+# ================== Timeslot + prompts helpers ==================
+
+def _nearest_slot_within_delta(slots: List[Dict[str, Any]], desired_from_iso: str, delta_min: int, drop_id: Optional[int]=None) -> Optional[Dict[str, Any]]:
+    try:
+        target = datetime.fromisoformat(desired_from_iso.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
+    best_after = None
+    best_after_d = None
+    best_any = None
+    best_any_d = None
+    for s in slots:
+        if drop_id is not None:
+            sid = s.get("drop_off_point_warehouse_id") or s.get("drop_off_warehouse_id")
+            try:
+                if sid is not None and int(sid) != int(drop_id):
+                    continue
+            except Exception:
+                pass
+        fr = s.get("from_in_timezone") or s.get("from")
+        if not fr:
+            continue
+        try:
+            ts = datetime.fromisoformat(fr.replace("Z", "+00:00")).timestamp()
+        except Exception:
+            continue
+        d = abs(ts - target)
+        if d > delta_min * 60:
+            continue
+        if ts >= target:
+            if best_after_d is None or d < best_after_d:
+                best_after = s
+                best_after_d = d
+        if best_any_d is None or d < best_any_d:
+            best_any = s
+            best_any_d = d
+    return best_after or best_any
 
 async def _auto_fill_timeslot_if_needed(task: Dict[str, Any], api: OzonApi, meta: Dict[str, Any], notify_text) -> bool:
     ts_meta = meta.get("timeslot") or {}
-    required = bool(ts_meta.get("required"))
     can_set = bool(ts_meta.get("can_set"))
     has_from = ts_meta.get("from")
     has_to = ts_meta.get("to")
 
-    if has_from and has_to:
-        return True
-    if not required or not can_set:
+    if not can_set:
         return True
 
-    fr = task.get("from_in_timezone") or task.get("desired_from_iso") or task.get("slot_from")
-    to = task.get("to_in_timezone") or task.get("desired_to_iso") or task.get("slot_to")
+    fr = task.get("from_in_timezone") or task.get("desired_from_iso") or task.get("slot_from") or task.get("desired_from_iso")
+    to = task.get("to_in_timezone") or task.get("desired_to_iso") or task.get("slot_to") or task.get("desired_to_iso")
     if not (fr and to):
         return False
+
+    if has_from and has_to:
+        def _eq(a, b):
+            try:
+                return int(datetime.fromisoformat(a.replace("Z","+00:00")).timestamp()) == int(datetime.fromisoformat(b.replace("Z","+00:00")).timestamp())
+            except Exception:
+                return a == b
+        zf = _to_z_iso(fr) or fr
+        zt = _to_z_iso(to) or to
+        if _eq(has_from, zf) and _eq(has_to, zt):
+            return True
 
     if task.get("order_timeslot_set_ok"):
         return True
     if now_ts() - int(task.get("order_timeslot_set_ts") or 0) < 10:
         return True
 
-    ok, err, status = await api_supply_order_timeslot_set(
+    ok, err, status, op_id = await api_supply_order_timeslot_set(
         api,
         task["order_id"],
         fr,
@@ -1438,10 +1758,13 @@ async def _auto_fill_timeslot_if_needed(task: Dict[str, Any], api: OzonApi, meta
 
     if ok:
         task["order_timeslot_set_ok"] = True
+        if op_id:
+            task["order_timeslot_op_id"] = str(op_id)
+        task["order_fast_poll_until_ts"] = now_ts() + int(max(ORDER_FAST_POLL_WINDOW_SECONDS, 300))
         task.pop("last_error", None)
         update_task(task)
         try:
-            await notify_text(task["chat_id"], f"🟦 [{short(task['id'])}] Тайм‑слот проставлен в заявке.")
+            await notify_text(task["chat_id"], f"🟦 [{short(task['id'])}] Тайм‑слот заявки отправлен на установку (operation_id={op_id or '—'}).")
         except Exception:
             logging.exception("notify_text failed on timeslot set OK")
         return True
@@ -1449,18 +1772,15 @@ async def _auto_fill_timeslot_if_needed(task: Dict[str, Any], api: OzonApi, meta
     if err == "not_supported_404" or status == 404:
         task["order_timeslot_set_ok"] = True
         task["order_timeslot_set_note"] = "timeslot API not available; relying on supply create"
-        if task.get("order_id") and not task.get("supply_id"):
-            task["supply_id"] = str(task["order_id"])
-        # FIX: корректный статус константы
-        task["status"] = ST_CARGO_PREP if AUTO_CREATE_CARGOES else ST_DONE
+        task["order_fast_poll_until_ts"] = now_ts() + int(ORDER_FAST_POLL_WINDOW_SECONDS)
+        task["status"] = ST_ORDER_DATA_FILLING
         task["retry_after_ts"] = 0
         task["retry_after_jitter"] = 0.0
         task["next_attempt_ts"] = now_ts()
         task.pop("last_error", None)
         update_task(task)
-        logging.info("timeslot_set: not_supported_404 -> promoted to %s (supply_id=%s)", task["status"], task.get("supply_id"))
         try:
-            await notify_text(task["chat_id"], f"🟦 [{short(task['id'])}] Тайм‑слот пропущен (404). Переход к подготовке грузов.")
+            await notify_text(task["chat_id"], f"🟦 [{short(task['id'])}] Тайм‑слот API заявки недоступен (404). Продолжаем.")
         except Exception:
             logging.exception("notify_text failed on promote after 404")
         return True
@@ -1472,138 +1792,12 @@ async def _auto_fill_timeslot_if_needed(task: Dict[str, Any], api: OzonApi, meta
         task["order_timeslot_warn_ts"] = now_ts()
         update_task(task)
         try:
-            await notify_text(task["chat_id"], f"🟨 [{short(task['id'])}] Не удалось проставить тайм‑слот (повторим).")
+            await notify_text(task["chat_id"], f"🟨 [{short(task['id'])}] Не удалось проставить тайм‑слот в заявке (повторим).")
         except Exception:
             logging.exception("notify_text failed on timeslot warn")
     return False
 
-async def _prompt_missing_fields(task: Dict[str, Any], meta: Dict[str, Any], notify_text) -> bool:
-    asked = False
-    veh = meta.get("vehicle") or {}
-    cnt = meta.get("contact") or {}
-
-    nowv = now_ts()
-    is_crossdock = (str(task.get("supply_type") or "").upper() == "CREATE_TYPE_CROSSDOCK") or bool(
-        task.get("dropoff_warehouse_id") or task.get("drop_off_point_warehouse_id") or task.get("drop_off_id") or DROP_OFF_WAREHOUSE_ID
-    )
-
-    if veh.get("required") and not is_crossdock and not task.get("order_vehicle_text"):
-        if nowv - int(task.get("need_vehicle_prompt_ts") or 0) >= PROMPT_MIN_INTERVAL:
-            task["need_vehicle"] = True
-            task["need_vehicle_prompt_ts"] = nowv
-            update_task(task)
-            try:
-                await notify_text(
-                    task["chat_id"],
-                    "🚚 Для заявки требуется транспорт. Ответьте сообщением:\n"
-                    f"ТРАНСПОРТ {short(task['id'])} <госномер и описание>\n"
-                    f"пример: ТРАНСПОРТ {short(task['id'])} А123ВС 116 RUS Газель тент"
-                )
-            except Exception:
-                logging.exception("notify_text failed on vehicle prompt")
-            asked = True
-    else:
-        if task.get("need_vehicle"):
-            task["need_vehicle"] = False
-            update_task(task)
-
-    if cnt.get("required") and not (task.get("order_contact_phone") or task.get("order_contact_name")):
-        if nowv - int(task.get("need_contact_prompt_ts") or 0) >= PROMPT_MIN_INTERVAL:
-            task["need_contact"] = True
-            task["need_contact_prompt_ts"] = nowv
-            update_task(task)
-            try:
-                await notify_text(
-                    task["chat_id"],
-                    "📱 Для заявки требуется контакт. Ответьте сообщением:\n"
-                    f"КОНТАКТ {short(task['id'])} +79990000000 [Имя]\n"
-                    f"пример: КОНТАКТ {short(task['id'])} +79991234567 Иван"
-                )
-            except Exception:
-                logging.exception("notify_text failed on contact prompt")
-            asked = True
-    else:
-        if task.get("need_contact"):
-            task["need_contact"] = False
-            update_task(task)
-
-    return asked
-
-# ================== Cargo payload builders and variants ==================
-
-def _cargo_type_candidates() -> List[str]:
-    return ["BOX", "CARGO_TYPE_BOX"]
-
-def build_cargoes_payload_variants(task: Dict[str, Any]) -> List[Dict[str, Any]]:
-    supply_id = task.get("supply_id")
-    if not supply_id:
-        raise RuntimeError("supply_id is not ready yet")
-
-    base_items: List[Dict[str, Any]] = []
-    for line in task["sku_list"]:
-        sku = to_int_or_str(line["sku"])
-        boxes = int(line["boxes"])
-        per_box = int(line["per_box"])
-        for _ in range(boxes):
-            base_items.append({"sku": sku, "quantity": per_box})
-
-    def make_payload(per_keys: List[str], top_keys: List[str], value: str) -> Dict[str, Any]:
-        cargos: List[Dict[str, Any]] = []
-        for it in base_items:
-            c: Dict[str, Any] = {"key": str(uuid.uuid4()), "items": [dict(it)]}
-            for k in per_keys:
-                c[k] = value
-            cargos.append(c)
-        payload: Dict[str, Any] = {"supply_id": supply_id, "delete_current_version": True, "cargoes": cargos}
-        for k in top_keys:
-            payload[k] = value
-        return payload
-
-    variants: List[Dict[str, Any]] = []
-    per_key_sets: List[List[str]] = [
-        ["CargoType"], ["cargoType"], ["cargo_type"], ["type"],
-        ["CargoType", "type"], ["cargoType", "type"],
-    ]
-
-    for val in _cargo_type_candidates():
-        for per in per_key_sets[:4]:
-            variants.append(make_payload(per, [], val))
-        variants.append(make_payload(["CargoType"], ["CargoType"], val))
-        variants.append(make_payload(["cargoType"], ["cargoType"], val))
-        variants.append(make_payload(["cargo_type"], ["cargo_type"], val))
-        variants.append(make_payload(["type"], ["type"], val))
-        variants.append(make_payload(["CargoType"], ["type"], val))
-        variants.append(make_payload(["cargoType"], ["type"], val))
-
-    dedup: List[Dict[str, Any]] = []
-    seen: set[str] = set()
-    for pl in variants:
-        key = json.dumps(pl, sort_keys=True, ensure_ascii=False)
-        if key in seen:
-            continue
-        seen.add(key)
-        dedup.append(pl)
-    return dedup
-
-def build_cargoes_from_task(task: Dict[str, Any]) -> Dict[str, Any]:
-    supply_id = task.get("supply_id")
-    if not supply_id:
-        raise RuntimeError("supply_id is not ready yet")
-    cargoes: List[Dict[str, Any]] = []
-    for line in task["sku_list"]:
-        sku = to_int_or_str(line["sku"])
-        boxes = int(line["boxes"])
-        per_box = int(line["per_box"])
-        for _ in range(boxes):
-            cargoes.append({
-                "key": str(uuid.uuid4()),
-                "CargoType": "BOX",
-                "cargoType": "BOX",
-                "cargo_type": OZON_CARGO_TYPE_DEFAULT,
-                "type": "BOX",
-                "items": [{"sku": sku, "quantity": per_box}]
-            })
-    return {"supply_id": supply_id, "delete_current_version": True, "cargoes": cargoes}
+# ================== Helpers ==================
 
 def _inc_backoff(task: Dict[str, Any]) -> int:
     b = int(task.get("create_backoff_sec") or CREATE_INITIAL_BACKOFF)
@@ -1618,7 +1812,22 @@ def _set_retry_after(task: Dict[str, Any], seconds: int, jitter_max: float = 0.3
     task["next_attempt_ts"] = task["retry_after_ts"]
     task["retry_after_jitter"] = jitter
 
-# ================== Self-wakeup (robust) ==================
+def _fmt_local_range_short(fr_iso: Optional[str], to_iso: Optional[str]) -> str:
+    def _p(s: Optional[str]) -> Optional[datetime]:
+        if not s:
+            return None
+        try:
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        except Exception:
+            return None
+        return dt.astimezone(TZ_YEKAT)
+    a = _p(fr_iso)
+    b = _p(to_iso)
+    if not a or not b:
+        return "—"
+    return f"{a.strftime('%d.%m %H:%M')}–{b.strftime('%H:%M')}"
+
+# ================== Self-wakeup ==================
 
 _pending_wakeup_ts: Optional[float] = None
 
@@ -1664,7 +1873,7 @@ def _schedule_self_wakeup(delay: float, notify_text, notify_file):
     delay = max(0.05, float(delay))
     target_ts = time.time() + delay
     if _pending_wakeup_ts is not None and _pending_wakeup_ts <= target_ts:
-        logging.debug("self-wakeup: earlier wakeup already scheduled (%.2fs), skip new", _pending_wakeup_ts - time.time())
+        logging.debug("self-wakeup: earlier wakeup already scheduled, skip new")
         return
     _pending_wakeup_ts = target_ts
     try:
@@ -1700,11 +1909,48 @@ def sanitize_tasks_legacy_cyrillic():
             t["retry_after_ts"] = 0
             changed = True
 
+        sid = str(t.get("supply_id") or "")
+        for num_key in ("supply_order_number", "order_number", "number"):
+            num = str(t.get(num_key) or "")
+            if sid and num and sid == num:
+                t["supply_id"] = None
+                t["supply_id_verified"] = False
+                t["status"] = ST_ORDER_DATA_FILLING if t.get("order_id") else ST_SUPPLY_ORDER_FETCH
+                t["next_attempt_ts"] = 0
+                t["retry_after_ts"] = 0
+                changed = True
+                break
+
+        if not t.get("supply_id_verified"):
+            try:
+                wid = int(t.get("chosen_warehouse_id") or 0)
+            except Exception:
+                wid = 0
+            try:
+                did = int(t.get("dropoff_warehouse_id") or t.get("drop_off_point_warehouse_id") or t.get("drop_off_id") or 0)
+            except Exception:
+                did = 0
+            try:
+                sid_int = int(sid) if sid else 0
+            except Exception:
+                sid_int = 0
+
+            if sid_int and (sid_int == wid or sid_int == did):
+                t["supply_id"] = None
+                t["supply_id_verified"] = False
+                if t.get("order_id"):
+                    t["status"] = ST_ORDER_DATA_FILLING
+                else:
+                    t["status"] = ST_SUPPLY_ORDER_FETCH
+                t["next_attempt_ts"] = 0
+                t["retry_after_ts"] = 0
+                changed = True
+
     if changed:
         save_tasks()
-        logging.info("sanitize_tasks_legacy_cyrillic: normalized statuses and reset timings")
+        logging.debug("sanitize_tasks_legacy_cyrillic: normalized statuses and reset timings")
 
-# ================== Create/Cancel/Retry ==================
+# ================== Create/Cancel/Retry/Delete (public) ==================
 
 def create_tasks_from_template(raw_text: str, mode: str, chat_id: int) -> List[Dict[str, Any]]:
     ensure_loaded()
@@ -1736,7 +1982,6 @@ def create_tasks_from_template(raw_text: str, mode: str, chat_id: int) -> List[D
             "next_attempt_ts": 0,
             "retry_after_ts": 0,
             "creating": False,
-            "create_attempts": 0,
             "last_error": ""
         }
         if not task.get("drop_off_id") and DROP_OFF_WAREHOUSE_ID:
@@ -1772,82 +2017,19 @@ def retry_task(task_id: str) -> Tuple[bool, str]:
             "retry_after_jitter", "draft_info_rl_attempts", "timeslot_rl_attempts",
             "supply_status_rl_attempts", "order_get_rl_attempts", "order_timeslot_warn_ts",
             "draft_last_try_ts", "draft_rl_attempts", "cargo_payload_variants", "cargo_variant_idx",
-            "last_draft_http_attempt_ts", "__draft_pacing_scheduled_ts", "last_trace_id"
+            "last_draft_http_attempt_ts", "__draft_pacing_scheduled_ts", "last_trace_id", "cargo_api_ver",
+            "supply_id_verified", "order_fast_poll_until_ts", "supply_id_wait_started_ts", "supply_id_timeout_alert_ts",
+            "order_timeslot_op_unsupported", "order_timeslot_refresh_ts", "last_supply_http_attempt_ts",
+            "cargo_prep_prompted", "autodelete_ts", "created_message_ts",
+            "draft_created_ts", "draft_404_count", "draft_first_404_ts", "stale_draft_recreates", "last_draft_missing_ts"
         ):
             t.pop(k, None)
     t["status"] = ST_WAIT_WINDOW
     t["next_attempt_ts"] = 0
     t["retry_after_ts"] = 0
     t["creating"] = False
-    t["create_attempts"] = 0
     update_task(t)
     return True, "OK"
-
-# ================== Глобальный пейсинг и cooldown для draft/create ==================
-
-_DRAFT_RATE_LOCK = threading.RLock()
-_DRAFT_RATE_FILE = DATA_DIR / ".draft_create_next_allowed"
-_DRAFT_COOLDOWN_FILE = DATA_DIR / ".draft_create_cooldown_until"
-_DRAFT_RATE_LOCKFILE = DATA_DIR / ".draft_create_next_allowed.lock"
-
-def _read_int_from_file(p: Path) -> int:
-    try:
-        s = p.read_text(encoding="utf-8").strip()
-        return int(s) if s else 0
-    except Exception:
-        return 0
-
-def _write_int_to_file(p: Path, v: int):
-    try:
-        p.write_text(str(int(v)), encoding="utf-8")
-    except Exception:
-        pass
-
-@contextmanager
-def _interprocess_lock(path: Path):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(str(path), "a+b") as f:
-        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-        try:
-            yield f
-        finally:
-            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-
-def _read_next_allowed_ts() -> int:
-    return _read_int_from_file(_DRAFT_RATE_FILE)
-
-def _write_next_allowed_ts(ts: int):
-    _write_int_to_file(_DRAFT_RATE_FILE, ts)
-
-def _read_draft_cooldown_until() -> int:
-    return _read_int_from_file(_DRAFT_COOLDOWN_FILE)
-
-def _write_draft_cooldown_until(ts: int):
-    _write_int_to_file(_DRAFT_COOLDOWN_FILE, ts)
-
-def _reserve_draft_slot_or_wait() -> int:
-    # Межпроцессная и межпоточная синхронизация доступа к окну create
-    with _interprocess_lock(_DRAFT_RATE_LOCKFILE):
-        with _DRAFT_RATE_LOCK:
-            n = now_ts()
-            next_allowed = _read_next_allowed_ts()
-            if n < next_allowed:
-                return max(1, next_allowed - n)
-            _write_next_allowed_ts(n + DRAFT_CREATE_MIN_SPACING_SECONDS)
-            return 0
-
-def _draft_global_wait() -> int:
-    n = now_ts()
-    until = _read_draft_cooldown_until()
-    if until > n:
-        return until - n
-    return 0
-
-def _set_global_draft_cooldown(base_wait: float):
-    sec = int(max(1.0, float(base_wait) + random.uniform(0.2, 1.1)))
-    until = now_ts() + sec
-    _write_draft_cooldown_until(until)
-    logging.info("draft cooldown set: %ss (until=%s)", sec, until)
 
 # ================== Parse template (public) ==================
 
@@ -1874,10 +2056,43 @@ def parse_template(text: str) -> Tuple[str, str, str, List[Dict[str, Any]]]:
         raise ValueError("Нет позиций.")
     return date_iso, start_hhmm, end_hhmm, items
 
+# ================== Auto-delete helpers ==================
+
+def _cleanup_created_tasks() -> int:
+    """
+    Агрессивная очистка:
+    - Удаляет финальные задачи (ST_DONE, ST_FAILED, ST_CANCELED) немедленно.
+    - Удаляет задачи со статусом "Создано" сразу при AUTO_DELETE_CREATED_IMMEDIATE=1
+      или после наступления их autodelete_ts.
+    """
+    ensure_loaded()
+    now = now_ts()
+    to_keep: List[Dict[str, Any]] = []
+    removed = 0
+    for t in _tasks:
+        st = str(t.get("status") or "").upper()
+        if st in (ST_DONE, ST_FAILED, ST_CANCELED):
+            removed += 1
+            continue
+        if st == UI_STATUS_CREATED.upper():
+            ad = int(t.get("autodelete_ts") or 0)
+            if AUTO_DELETE_CREATED_IMMEDIATE:
+                removed += 1
+                continue
+            if ad and now >= ad:
+                removed += 1
+                continue
+        to_keep.append(t)
+    if removed:
+        _tasks[:] = to_keep
+        save_tasks()
+    return removed
+
 # ================== Main stepper ==================
 
-async def advance_task(task: Dict[str, Any], api: OzonApi, notify_text, notify_file) -> None:
-    if task.get("status") in (ST_DONE, ST_FAILED, ST_CANCELED):
+async def advance_task(task: Dict[str, Any], api: OzonApi, notify_text: Callable[[int, str], Awaitable[None]], notify_file: Callable[[int, str, Optional[str]], Awaitable[None]]) -> None:
+    # Пропуск финальных и визуально "Создано"
+    if task.get("status") in (ST_DONE, ST_FAILED, ST_CANCELED, UI_STATUS_CREATED):
         return
 
     n = now_ts()
@@ -1891,8 +2106,9 @@ async def advance_task(task: Dict[str, Any], api: OzonApi, notify_text, notify_f
             logging.exception("notify_text failed on window expired")
         return
 
-    if task.get("supply_id") and task.get("status") not in (ST_CARGO_PREP, ST_CARGO_CREATING, ST_POLL_CARGO, ST_LABELS_CREATING, ST_POLL_LABELS, ST_DONE):
-        task["status"] = ST_CARGO_PREP if AUTO_CREATE_CARGOES else ST_DONE
+    st = str(task.get("status") or "").upper()
+    if task.get("supply_id_verified") and task.get("supply_id") and st not in (ST_CARGO_PREP, ST_CARGO_CREATING, ST_POLL_CARGO, ST_LABELS_CREATING, ST_POLL_LABELS, ST_DONE):
+        task["status"] = ST_CARGO_PREP
         task["next_attempt_ts"] = now_ts()
         task["retry_after_ts"] = 0
         task["retry_after_jitter"] = 0.0
@@ -1926,8 +2142,11 @@ async def advance_task(task: Dict[str, Any], api: OzonApi, notify_text, notify_f
         if st == ST_WAIT_WINDOW:
             task["status"] = ST_DRAFT_CREATING
             task["creating"] = False
-            task.setdefault("create_attempts", 0)
             task.pop("create_backoff_sec", None)
+            # Сброс счётчиков 404 по драфту
+            task.pop("draft_404_count", None)
+            task.pop("draft_first_404_ts", None)
+            task.pop("draft_created_ts", None)
             update_task(task)
             schedule(1)
             return
@@ -1936,32 +2155,24 @@ async def advance_task(task: Dict[str, Any], api: OzonApi, notify_text, notify_f
             if not SUPPLY_DISABLE_INTERNAL_GATE:
                 cd = _draft_global_wait()
                 if cd > 0:
-                    logging.info("draft cooldown active: %ss left", cd)
                     schedule(cd, mark="__draft_pacing_scheduled_ts")
-                    _schedule_self_wakeup(cd + 0.2, notify_text, notify_file)
                     return
 
                 wait = _reserve_draft_slot_or_wait()
                 if wait > 0:
-                    logging.info(
-                        "draft pacing: wait %ss (next_allowed=%s, now=%s) before /v1/draft/create for task=%s",
-                        wait, _read_next_allowed_ts(), now_ts(), short(task["id"])
-                    )
                     schedule(wait, mark="__draft_pacing_scheduled_ts")
-                    _schedule_self_wakeup(wait + 0.2, notify_text, notify_file)
                     return
 
             if task.get("creating"):
                 return
 
-            logging.info("draft/create: attempting now for task=%s", short(task["id"]))
             task["creating"] = True
             task["draft_last_try_ts"] = now_ts()
             task["last_draft_http_attempt_ts"] = now_ts()
+            task["last_supply_http_attempt_ts"] = task.get("last_supply_http_attempt_ts") or 0
             update_task(task)
 
             ok, op_id, err, status = await api_draft_create(api, task)
-
             task["creating"] = False
 
             if status == 429 or (err and str(err).startswith("rate_limit:")):
@@ -1969,14 +2180,13 @@ async def advance_task(task: Dict[str, Any], api: OzonApi, notify_text, notify_f
                     delay = int(str(err).split(":", 1)[1]) + 1
                 except Exception:
                     delay = max(2, int(task.get("retry_after_ts", 0) - now_ts()) + 1)
-                _schedule_self_wakeup(max(1, delay), notify_text, notify_file)
+                schedule(max(1, delay))
                 return
 
             if not ok:
                 if str(err).startswith("http_status:5") or str(err).startswith("http_error:") or status >= 500 or status == 0 or (err == "http_timeout"):
                     delay = max(_inc_backoff(task), SUPPLY_CREATE_MIN_RETRY_SECONDS)
                     task["last_error"] = f"server_or_timeout_error:{err}"
-                    task["create_attempts"] = int(task.get("create_attempts") or 0) + 1
                     update_task(task)
                     schedule(delay)
                     return
@@ -1993,6 +2203,8 @@ async def advance_task(task: Dict[str, Any], api: OzonApi, notify_text, notify_f
             task["draft_operation_id"] = op_id
             task["op_started_ts"] = now_ts()
             task["op_retries"] = 0
+            task.pop("draft_created_ts", None)
+            update_task(task)
             task["status"] = ST_POLL_DRAFT
             update_task(task)
             schedule(OPERATION_POLL_INTERVAL_SECONDS)
@@ -2022,7 +2234,7 @@ async def advance_task(task: Dict[str, Any], api: OzonApi, notify_text, notify_f
                 _set_retry_after(task, wait_sec, jitter_max=1.5)
                 task["last_error"] = "429 Too Many Requests (draft/info)"
                 update_task(task)
-                _schedule_self_wakeup(wait_sec + 1.0, notify_text, notify_file)
+                schedule(wait_sec + 1)
                 return
 
             if task.get("draft_info_rl_attempts"):
@@ -2047,7 +2259,11 @@ async def advance_task(task: Dict[str, Any], api: OzonApi, notify_text, notify_f
                 return
 
             task["draft_id"] = draft_id
-            chosen_wid = task.get("chosen_warehouse_id") or choose_warehouse(warehouses)
+            task["draft_created_ts"] = now_ts()  # метка возраста черновика
+            task.pop("draft_404_count", None)
+            task.pop("draft_first_404_ts", None)
+
+            chosen_wid = choose_warehouse_smart(task, warehouses) or task.get("chosen_warehouse_id")
             task["chosen_warehouse_id"] = chosen_wid
 
             if chosen_wid:
@@ -2061,9 +2277,6 @@ async def advance_task(task: Dict[str, Any], api: OzonApi, notify_text, notify_f
                         if bndl:
                             task["bundle_id"] = bndl
                         break
-
-            logging.info("Draft ready task=%s draft_id=%s chosen_warehouse_id=%s bundle_id=%s",
-                         short(task["id"]), draft_id, task.get("chosen_warehouse_id"), task.get("bundle_id"))
 
             task["status"] = ST_TIMESLOT_SEARCH
             update_task(task)
@@ -2082,7 +2295,7 @@ async def advance_task(task: Dict[str, Any], api: OzonApi, notify_text, notify_f
                     logging.exception("notify_text failed on no warehouse")
                 return
 
-            ok, slots, err, status = await api_timeslot_info(api, task["draft_id"], [wid], task["date"], task.get("bundle_id"))
+            ok, slots, err, status = await api_timeslot_info(api, task["draft_id"], [wid], task["date"], task.get("bundle_id") if task.get("bundle_id") else None)
             if status == 429 or (err and str(err or "").startswith("rate_limit:")):
                 attempts = int(task.get("timeslot_rl_attempts") or 0) + 1
                 task["timeslot_rl_attempts"] = attempts
@@ -2095,13 +2308,37 @@ async def advance_task(task: Dict[str, Any], api: OzonApi, notify_text, notify_f
                 _set_retry_after(task, wait_sec, jitter_max=1.5)
                 task["last_error"] = "429 Too Many Requests (timeslot)"
                 update_task(task)
-                _schedule_self_wakeup(wait_sec + 1.0, notify_text, notify_file)
+                schedule(wait_sec + 1)
                 return
+
+            if status == 404 or err == "not_found_404":
+                # Новая логика: немедленно пересоздаём черновик без лимитов
+                try:
+                    logging.info(
+                        "draft %s missing; recreate draft after 404 timeslot/info (task=%s)",
+                        str(task.get("draft_id") or "—"),
+                        short(task.get("id") or "")
+                    )
+                except Exception:
+                    pass
+                # Телеметрия
+                task["stale_draft_recreates"] = int(task.get("stale_draft_recreates") or 0) + 1
+                task["last_draft_missing_ts"] = now_ts()
+                # Сброс черновика
+                task.pop("draft_id", None)
+                task.pop("draft_operation_id", None)
+                task.pop("draft_created_ts", None)
+                task.pop("draft_404_count", None)
+                task.pop("draft_first_404_ts", None)
+                task["status"] = ST_DRAFT_CREATING
+                update_task(task)
+                schedule(1)
+                return
+
             if task.get("timeslot_rl_attempts"):
                 task.pop("timeslot_rl_attempts", None)
 
             if not ok or not slots:
-                logging.info("No timeslots yet for task=%s date=%s wid=%s", short(task["id"]), task["date"], wid)
                 schedule(SLOT_POLL_INTERVAL_SECONDS)
                 return
 
@@ -2112,22 +2349,57 @@ async def advance_task(task: Dict[str, Any], api: OzonApi, notify_text, notify_f
                 if (s.get("from_in_timezone") == desired_from and s.get("to_in_timezone") == desired_to):
                     matched = s
                     break
-            if not matched and slots:
-                for s in slots:
-                    cs = (s.get("capacity_status") or "").upper()
-                    if cs in ("AVAILABLE", "FREE", "OK", ""):
-                        matched = s
-                        break
+
+            if not matched and TIMESLOT_ALLOW_FALLBACK:
+                drop_id = int(DROP_OFF_WAREHOUSE_ID) if DROP_OFF_WAREHOUSE_ID else None
+                near = _nearest_slot_within_delta(slots, desired_from, TIMESLOT_FALLBACK_DELTA_MIN, drop_id=drop_id)
+                if near:
+                    matched = near
+                    desired_from = near.get("from_in_timezone") or near.get("from") or desired_from
+                    desired_to = near.get("to_in_timezone") or near.get("to") or desired_to
+
             if not matched:
                 schedule(SLOT_POLL_INTERVAL_SECONDS)
                 return
 
-            task["slot_from"] = matched.get("from_in_timezone")
-            task["slot_to"] = matched.get("to_in_timezone")
+            task["slot_from"] = matched.get("from_in_timezone") or matched.get("from")
+            task["slot_to"] = matched.get("to_in_timezone") or matched.get("to")
             task["slot_id"] = matched.get("id") or matched.get("timeslot_id") or matched.get("slot_id")
+            if matched.get("drop_off_point_warehouse_id"):
+                task["dropoff_warehouse_id"] = int(matched["drop_off_point_warehouse_id"])
+                update_task(task)
 
-            task["desired_from_iso"] = task["slot_from"]
-            task["desired_to_iso"] = task["slot_to"]
+            # Пытаемся закрепить слот в черновике — 404 на set НЕ вызывает пересоздание
+            if task.get("slot_id"):
+                ts_payload = {"id": task["slot_id"]}
+            else:
+                z_from = _to_z_iso(task["slot_from"]) or task["slot_from"]
+                z_to = _to_z_iso(task["slot_to"]) or task["slot_to"]
+                ts_payload = {"start_time": z_from, "end_time": z_to}
+
+            drop_id_for_set = task.get("dropoff_warehouse_id") or _extract_dropoff_id(task)
+            if drop_id_for_set:
+                ok_set, err_set, status_set = await api_draft_timeslot_set(api, int(task["draft_id"]), int(drop_id_for_set), ts_payload)
+                if status_set == 429 or (err_set and str(err_set).startswith("rate_limit:")):
+                    try:
+                        ra = int(str(err_set).split(":", 1)[1]) if err_set else ON429_SHORT_RETRY_SEC
+                    except Exception:
+                        ra = ON429_SHORT_RETRY_SEC
+                    _set_retry_after(task, min(RATE_LIMIT_MAX_ON429, max(1, ra)), jitter_max=1.0)
+                    task["last_error"] = "429 Too Many Requests (draft/timeslot/set)"
+                    update_task(task)
+                    schedule(min(RATE_LIMIT_MAX_ON429, max(1, ra)) + 1)
+                    return
+                if status_set == 404 or err_set == "not_found_404":
+                    # Просто пометим, что закрепление черновика недоступно, и поедем дальше
+                    task["draft_timeslot_set_unsupported"] = True
+                    update_task(task)
+                elif not ok_set:
+                    logging.warning("draft/timeslot/set failed (non-blocking), proceeding")
+
+            # Закрепляем актуальное окно для supply/create
+            task["desired_from_iso"] = desired_from
+            task["desired_to_iso"] = desired_to
             update_task(task)
 
             task["status"] = ST_SUPPLY_CREATING
@@ -2149,10 +2421,10 @@ async def advance_task(task: Dict[str, Any], api: OzonApi, notify_text, notify_f
                     ra = int(str(err).split(":", 1)[1]) if err else ON429_SHORT_RETRY_SEC
                 except Exception:
                     ra = ON429_SHORT_RETRY_SEC
-                _set_retry_after(task, min(RATE_LIMIT_MAX_ON429, max(1, ra)), jitter_max=1.0)
+                _set_retry_after(task, min(RATE_LIMIT_MAX_ON429, max(1, ra)), jitter_max=1.5)
                 task["last_error"] = "429 Too Many Requests (supply/create)"
                 update_task(task)
-                _schedule_self_wakeup(min(RATE_LIMIT_MAX_ON429, max(1, ra)) + 1.0, notify_text, notify_file)
+                schedule(min(RATE_LIMIT_MAX_ON429, max(1, ra)) + 1)
                 return
 
             if not ok:
@@ -2192,7 +2464,7 @@ async def advance_task(task: Dict[str, Any], api: OzonApi, notify_text, notify_f
                 _set_retry_after(task, wait_sec, jitter_max=1.5)
                 task["last_error"] = "429 Too Many Requests (supply/status)"
                 update_task(task)
-                _schedule_self_wakeup(wait_sec + 1.0, notify_text, notify_file)
+                schedule(wait_sec + 1)
                 return
             if task.get("supply_status_rl_attempts"):
                 task.pop("supply_status_rl_attempts", None)
@@ -2213,17 +2485,19 @@ async def advance_task(task: Dict[str, Any], api: OzonApi, notify_text, notify_f
 
             if not ok:
                 schedule(OPERATION_POLL_INTERVAL_SECONDS)
-                return
-
-            task["order_id"] = order_id
-            task["status"] = ST_SUPPLY_ORDER_FETCH
-            task["op_started_ts"] = now_ts()
-            task["op_retries"] = 0
-            update_task(task)
-            schedule(1)
+            else:
+                task["order_id"] = order_id
+                task["status"] = ST_SUPPLY_ORDER_FETCH
+                task["op_started_ts"] = now_ts()
+                task["op_retries"] = 0
+                task.setdefault("supply_id_wait_started_ts", now_ts())
+                update_task(task)
+                schedule(1)
             return
 
         if st in (ST_SUPPLY_ORDER_FETCH, ST_ORDER_DATA_FILLING):
+            task.setdefault("supply_id_wait_started_ts", now_ts())
+
             ok, supply_id, number, err, status, meta = await api_supply_order_get(api, task["order_id"])
             if status == 429 or (err and str(err or "").startswith("rate_limit:")):
                 attempts = int(task.get("order_get_rl_attempts") or 0) + 1
@@ -2237,14 +2511,58 @@ async def advance_task(task: Dict[str, Any], api: OzonApi, notify_text, notify_f
                 _set_retry_after(task, wait_sec, jitter_max=1.5)
                 task["last_error"] = "429 Too Many Requests (supply-order/get)"
                 update_task(task)
-                _schedule_self_wakeup(wait_sec + 1.0, notify_text, notify_file)
+                schedule(wait_sec + 1)
                 return
             if task.get("order_get_rl_attempts"):
                 task.pop("order_get_rl_attempts", None)
 
-            if not ok:
+            if ok:
+                task["supply_order_number"] = number or task.get("supply_order_number") or ""
+                if meta.get("dropoff_warehouse_id"):
+                    task["dropoff_warehouse_id"] = int(meta["dropoff_warehouse_id"])
+                    update_task(task)
+                if supply_id and not task.get("supply_id"):
+                    task["supply_id"] = str(supply_id)
+                    task["supply_id_verified"] = True
+                    update_task(task)
+
+                await _auto_fill_timeslot_if_needed(task, api, meta, notify_text)
+
+                if not task.get("cargo_prep_prompted"):
+                    link_main = SELLER_PORTAL_URL
+                    rng = _fmt_local_range_short(task.get("desired_from_iso") or task.get("slot_from"),
+                                                 task.get("desired_to_iso") or task.get("slot_to"))
+                    num = task.get("supply_order_number") or "—"
+                    wh_disp = warehouse_display(task)
+
+                    msg = (
+                        "🟦 Заявка создана\n"
+                        f"• Номер: {num}\n"
+                        f"• Окно приёмки: {rng}\n"
+                        f"• Склад: {wh_disp}\n"
+                        f"• Личный кабинет: {link_main}\n\n"
+                        "Действия: откройте ЛК, укажите грузоместа и количество, затем сгенерируйте этикетки."
+                    )
+                    try:
+                        await notify_text(task["chat_id"], msg)
+                    except Exception:
+                        logging.exception("notify_text failed on ORDER_DATA_FILLING prompt")
+
+                    task["cargo_prep_prompted"] = True
+                    task["created_message_ts"] = now_ts()
+                    task["autodelete_ts"] = now_ts() + int(AUTO_DELETE_CREATED_MINUTES) * 60
+
+                if AUTO_DELETE_CREATED_IMMEDIATE:
+                    delete_task(task["id"])
+                    return
+
+                task["status"] = UI_STATUS_CREATED
+                task["updated_ts"] = now_ts()
+                update_task(task)
+                return
+
+            else:
                 task["op_retries"] = int(task.get("op_retries") or 0) + 1
-                # FIX: корректное поле счётчика попыток
                 if task["op_retries"] > max(SUPPLY_MAX_OPERATION_RETRIES, ORDER_FILL_MAX_RETRIES):
                     task["status"] = ST_FAILED
                     task["last_error"] = str(err)
@@ -2254,246 +2572,15 @@ async def advance_task(task: Dict[str, Any], api: OzonApi, notify_text, notify_f
                     except Exception:
                         logging.exception("notify_text failed on supply-order/get")
                     return
-                schedule(ORDER_FILL_POLL_INTERVAL_SECONDS)
-                return
-
-            task["supply_order_number"] = number or task.get("supply_order_number") or ""
-            if meta.get("dropoff_warehouse_id"):
-                task["dropoff_warehouse_id"] = int(meta["dropoff_warehouse_id"])
-                update_task(task)
-
-            if supply_id and not task.get("supply_id"):
-                task["supply_id"] = str(supply_id)
-                update_task(task)
-
-            if not task.get("supply_id") and task.get("order_id"):
-                task["supply_id"] = str(task["order_id"])
-                update_task(task)
-
-            await _auto_fill_timeslot_if_needed(task, api, meta, notify_text)
-            await _prompt_missing_fields(task, meta, notify_text)
 
             task["status"] = ST_ORDER_DATA_FILLING
             update_task(task)
-            schedule(ORDER_FILL_POLL_INTERVAL_SECONDS)
-            return
 
-        if st == ST_CARGO_PREP:
-            logging.info("enter CARGO_PREP task=%s supply_id=%s next=%s retry_after=%s",
-                         short(task["id"]), task.get("supply_id"),
-                         task.get("next_attempt_ts"), task.get("retry_after_ts"))
-            variants = build_cargoes_payload_variants(task)
-            task["cargo_payload_variants"] = variants
-            task["cargo_variant_idx"] = 0
-            task["cargo_payload"] = variants[0]
-            update_task(task)
-            task["status"] = ST_CARGO_CREATING
-            task["next_attempt_ts"] = now_ts()
-            task["retry_after_ts"] = 0
-            task["retry_after_jitter"] = 0.0
-            update_task(task)
-            return
-
-        if st == ST_CARGO_CREATING:
-            if task.get("creating"):
-                return
-            if not task.get("cargo_payload"):
-                variants = task.get("cargo_payload_variants") or build_cargoes_payload_variants(task)
-                task["cargo_payload_variants"] = variants
-                task["cargo_variant_idx"] = int(task.get("cargo_variant_idx") or 0)
-                if task["cargo_variant_idx"] >= len(variants):
-                    task["cargo_variant_idx"] = 0
-                task["cargo_payload"] = variants[task["cargo_variant_idx"]]
-                update_task(task)
-
-            task["creating"] = True
-            update_task(task)
-
-            ok, op_id, err, status = await api_cargoes_create(api, task["cargo_payload"])
-            task["creating"] = False
-
-            if status == 429 or (err and str(err or "").startswith("rate_limit:")):
-                try:
-                    ra = int(str(err).split(":", 1)[1]) if err else ON429_SHORT_RETRY_SEC
-                except Exception:
-                    ra = ON429_SHORT_RETRY_SEC
-                _set_retry_after(task, min(RATE_LIMIT_MAX_ON429, max(1, ra)), jitter_max=1.5)
-                task["last_error"] = "429 Too Many Requests (cargoes/create)"
-                update_task(task)
-                _schedule_self_wakeup(min(RATE_LIMIT_MAX_ON429, max(1, ra)) + 1.0, notify_text, notify_file)
-                return
-
-            if not ok:
-                err_text = str(err or "")
-                if "CargoType must be set" in err_text:
-                    variants = task.get("cargo_payload_variants") or []
-                    cur = int(task.get("cargo_variant_idx") or 0)
-                    nxt = cur + 1
-                    if variants and nxt < len(variants):
-                        task["cargo_variant_idx"] = nxt
-                        task["cargo_payload"] = variants[nxt]
-                        task["last_error"] = "switch_cargo_type_variant"
-                        task["next_attempt_ts"] = now_ts()
-                        task["retry_after_ts"] = 0
-                        update_task(task)
-                        logging.warning("cargoes/create: switching variant %s -> %s due to 'CargoType must be set'", cur, nxt)
-                        return
-                    else:
-                        msg = "cargoes_create_error: CargoType must be set (all variants tried). "\
-                              "Попробуйте OZON_CARGO_TYPE_DEFAULT=BOX или CARGO_TYPE_BOX."
-                        task["status"] = ST_FAILED
-                        task["last_error"] = msg
-                        update_task(task)
-                        try:
-                            await notify_text(task["chat_id"], f"🟥 [{short(task['id'])}] {msg}")
-                        except Exception:
-                            logging.exception("notify_text failed on cargoes/create variants exhausted")
-                        return
-
-                if str(err).startswith("http_status:5") or str(err).startswith("http_error:") or status >= 500 or status == 0 or (err == "http_timeout"):
-                    delay = max(_inc_backoff(task), SUPPLY_CREATE_MIN_RETRY_SECONDS)
-                    task["last_error"] = f"cargoes_create_server_or_timeout:{err}"
-                    update_task(task)
-                    schedule(delay)
-                    return
-                task["status"] = ST_FAILED
-                task["last_error"] = str(err)
-                update_task(task)
-                try:
-                    await notify_text(task["chat_id"], f"🟥 [{short(task['id'])}] cargoes/create: {err}")
-                except Exception:
-                    logging.exception("notify_text failed on cargoes/create")
-                return
-
-            task["cargo_operation_id"] = op_id
-            task["op_started_ts"] = now_ts()
-            # FIX: корректное поле счётчика попыток
-            task["op_retries"] = 0
-            task["status"] = ST_POLL_CARGO
-            update_task(task)
-            schedule(OPERATION_POLL_INTERVAL_SECONDS)
-            return
-
-        if st == ST_POLL_CARGO:
-            ok, cargoes, err, status = await api_cargoes_create_info(api, task["cargo_operation_id"])
-            if status == 429 or (err and str(err or "").startswith("rate_limit:")):
-                try:
-                    ra = int(str(err).split(":", 1)[1]) if err else ON429_SHORT_RETRY_SEC
-                except Exception:
-                    ra = ON429_SHORT_RETRY_SEC
-                _set_retry_after(task, min(RATE_LIMIT_MAX_ON429, max(1, ra)), jitter_max=1.5)
-                task["last_error"] = "429 Too Many Requests (cargoes/info)"
-                update_task(task)
-                _schedule_self_wakeup(min(RATE_LIMIT_MAX_ON429, max(1, ra)) + 1.0, notify_text, notify_file)
-                return
-
-            if err:
-                task["op_retries"] = int(task.get("op_retries") or 0) + 1
-                if task["op_retries"] > SUPPLY_MAX_OPERATION_RETRIES:
-                    task["status"] = ST_FAILED
-                    task["last_error"] = str(err)
-                    update_task(task)
-                    try:
-                        await notify_text(task["chat_id"], f"🟥 [{short(task['id'])}] cargoes/info: {err}")
-                    except Exception:
-                        logging.exception("notify_text failed on cargoes/info")
-                    return
-                schedule(OPERATION_POLL_INTERVAL_SECONDS)
-                return
-
-            if not ok:
-                schedule(OPERATION_POLL_INTERVAL_SECONDS)
+            fast_until = int(task.get("order_fast_poll_until_ts") or 0)
+            if fast_until and now_ts() < fast_until and not task.get("supply_id"):
+                schedule(max(3, int(ORDER_FAST_POLL_SECONDS)))
             else:
-                task["cargo_ids"] = [c.get("cargo_id") for c in cargoes if c.get("cargo_id")]
-                task["status"] = ST_LABELS_CREATING if AUTO_CREATE_LABELS else ST_DONE
-                update_task(task)
-                schedule(1)
-            return
-
-        if st == ST_LABELS_CREATING:
-            if task.get("creating"):
-                return
-            task["creating"] = True
-            update_task(task)
-
-            ok, op_id, err, status = await api_labels_create(api, task["supply_id"], task.get("cargo_ids"))
-            task["creating"] = False
-
-            if status == 429 or (err and str(err or "").startswith("rate_limit:")):
-                try:
-                    ra = int(str(err).split(":", 1)[1]) if err else ON429_SHORT_RETRY_SEC
-                except Exception:
-                    ra = ON429_SHORT_RETRY_SEC
-                _set_retry_after(task, min(RATE_LIMIT_MAX_ON429, max(1, ra)), jitter_max=1.5)
-                task["last_error"] = "429 Too Many Requests (labels/create)"
-                update_task(task)
-                _schedule_self_wakeup(min(RATE_LIMIT_MAX_ON429, max(1, ra)) + 1.0, notify_text, notify_file)
-                return
-
-            if not ok:
-                if str(err).startswith("http_status:5") or str(err).startswith("http_error:") or status >= 500 or status == 0 or (err == "http_timeout"):
-                    delay = max(_inc_backoff(task), SUPPLY_CREATE_MIN_RETRY_SECONDS)
-                    task["last_error"] = f"labels_create_server_or_timeout:{err}"
-                    update_task(task)
-                    schedule(delay)
-                    return
-
-            task["labels_operation_id"] = op_id
-            task["op_started_ts"] = now_ts()
-            task["op_retries"] = 0
-            task["status"] = ST_POLL_LABELS
-            update_task(task)
-            schedule(OPERATION_POLL_INTERVAL_SECONDS)
-            return
-
-        if st == ST_POLL_LABELS:
-            ok, file_guid, err, status = await api_labels_get(api, task["labels_operation_id"])
-            if status == 429 or (err and str(err or "").startswith("rate_limit:")):
-                try:
-                    ra = int(str(err).split(":", 1)[1]) if err else ON429_SHORT_RETRY_SEC
-                except Exception:
-                    ra = ON429_SHORT_RETRY_SEC
-                _set_retry_after(task, min(RATE_LIMIT_MAX_ON429, max(1, ra)), jitter_max=1.5)
-                task["last_error"] = "429 Too Many Requests (labels/get)"
-                update_task(task)
-                _schedule_self_wakeup(min(RATE_LIMIT_MAX_ON429, max(1, ra)) + 1.0, notify_text, notify_file)
-                return
-
-            if err:
-                task["op_retries"] += 1
-                if task["op_retries"] > SUPPLY_MAX_OPERATION_RETRIES:
-                    task["status"] = ST_FAILED
-                    task["last_error"] = str(err)
-                    update_task(task)
-                    try:
-                        await notify_text(task["chat_id"], f"🟥 [{short(task['id'])}] labels/get: {err}")
-                    except Exception:
-                        logging.exception("notify_text failed on labels/get")
-                    return
-
-            if not ok:
-                schedule(OPERATION_POLL_INTERVAL_SECONDS)
-                return
-
-            task["labels_file_guid"] = file_guid
-            ok2, pdf_bytes, err2 = await api_labels_file(api, file_guid)
-            if ok2 and pdf_bytes:
-                pdf_path = DATA_DIR / f"labels_{task['id']}.pdf"
-                pdf_path.write_bytes(pdf_bytes)
-                task["labels_pdf_path"] = str(pdf_path)
-                update_task(task)
-                if AUTO_SEND_LABEL_PDF and pdf_path.exists():
-                    try:
-                        await notify_file(task["chat_id"], str(pdf_path), f"Этикетки supply_id={task.get('supply_id')} №{task.get('supply_order_number','')}".strip())
-                    except Exception:
-                        logging.exception("notify_file failed on labels pdf")
-
-            task["status"] = ST_DONE
-            update_task(task)
-            try:
-                await notify_text(task["chat_id"], f"🟩 [{short(task['id'])}] Готово. supply_id={task.get('supply_id')} cargo={len(task.get('cargo_ids',[]))}")
-            except Exception:
-                logging.exception("notify_text failed on DONE")
+                schedule(max(5, int(ORDER_FILL_POLL_INTERVAL_SECONDS)))
             return
 
     except Exception as e:
@@ -2510,43 +2597,16 @@ async def advance_task(task: Dict[str, Any], api: OzonApi, notify_text, notify_f
 
 _SCHEDULER_JOB_ID = "supply_process_tasks"
 
-def register_supply_scheduler(scheduler, notify_text, notify_file, interval_seconds: int = 45):
-    try:
-        existing = scheduler.get_job(_SCHEDULER_JOB_ID)
-    except Exception:
-        existing = None
-
-    if existing is not None:
-        logging.info("Scheduler job '%s' already registered. Skip duplicate.", _SCHEDULER_JOB_ID)
-        return
-
-    async def _async_job():
-        try:
-            if _lock.locked():
-                logging.info("process_tasks: SKIP (already running) [scheduler]")
-                return
-            await process_tasks(notify_text, notify_file)
-        except Exception:
-            logging.exception("Scheduler async job failed")
-
-    try:
-        scheduler.add_job(
-            _async_job,
-            "interval",
-            seconds=max(5, int(interval_seconds)),
-            id=_SCHEDULER_JOB_ID,
-            coalesce=True,
-            max_instances=1,
-            replace_existing=False,
-            misfire_grace_time=10,
-        )
-        logging.info("Scheduler job '%s' registered (interval=%ss).", _SCHEDULER_JOB_ID, interval_seconds)
-    except Exception:
-        logging.exception("Failed to register scheduler job '%s'", _SCHEDULER_JOB_ID)
-
-async def process_tasks(notify_text, notify_file):
+async def process_tasks(notify_text: Callable[[int, str], Awaitable[None]], notify_file: Callable[[int, str, Optional[str]], Awaitable[None]]):
     ensure_loaded()
     sanitize_tasks_legacy_cyrillic()
+
+    try:
+        removed = _cleanup_created_tasks()
+        if removed:
+            logging.info("auto-clean tasks: removed=%s", removed)
+    except Exception:
+        logging.exception("cleanup_created_tasks failed")
 
     if _lock.locked():
         logging.info("process_tasks: SKIP (already running)")
@@ -2559,27 +2619,32 @@ async def process_tasks(notify_text, notify_file):
         drafts_done = 0
         supplies_done = 0
 
-        for task in list_tasks():
+        active_list = list_tasks()
+        for task in active_list:
             if task.get("status") == ST_CANCELED:
                 continue
 
-            st = str(task.get("status") or "").upper()
+            st = str(task.get("status") or "")
+            if st == UI_STATUS_CREATED:
+                continue
 
-            if st == ST_DRAFT_CREATING and drafts_done >= SUPPLY_MAX_DRAFTS_PER_TICK:
+            st_u = st.upper()
+
+            if st_u == ST_DRAFT_CREATING and drafts_done >= SUPPLY_MAX_DRAFTS_PER_TICK:
                 task["next_attempt_ts"] = now_ts() + 30
                 update_task(task)
                 logging.info("draft quota reached; defer task=%s", short(task["id"]))
                 continue
 
-            if st == ST_SUPPLY_CREATING and supplies_done >= SUPPLY_MAX_SUPPLY_CREATES_PER_TICK:
+            if st_u == ST_SUPPLY_CREATING and supplies_done >= SUPPLY_MAX_SUPPLY_CREATES_PER_TICK:
                 task["next_attempt_ts"] = now_ts() + SUPPLY_CREATE_STAGE_DELAY_SECONDS
                 update_task(task)
                 logging.info("supply-create quota reached; defer task=%s", short(task["id"]))
                 continue
 
-            prev_status = st
-            prev_creating = bool(task.get("creating"))
+            prev_status = st_u
             prev_draft_http_ts = int(task.get("last_draft_http_attempt_ts") or 0)
+            prev_supply_http_ts = int(task.get("last_supply_http_attempt_ts") or 0)
 
             try:
                 await asyncio.wait_for(
@@ -2594,47 +2659,113 @@ async def process_tasks(notify_text, notify_file):
                     update_task(tnow)
                 except Exception:
                     pass
+            except Exception:
+                logging.exception("advance_task crashed for task=%s", short(task["id"]))
 
             tnow = get_task(task["id"]) or task
-            new_status = str(tnow.get("status") or "").upper()
             new_draft_http_ts = int(tnow.get("last_draft_http_attempt_ts") or 0)
-            draft_http_called = (new_draft_http_ts > prev_draft_http_ts)
-
-            pacing_flag = tnow.get("__draft_pacing_scheduled_ts")
-            if pacing_flag and prev_status == ST_DRAFT_CREATING:
-                try:
-                    tnow.pop("__draft_pacing_scheduled_ts", None)
-                    update_task(tnow)
-                except Exception:
-                    pass
+            new_supply_http_ts = int(tnow.get("last_supply_http_attempt_ts") or 0)
+            if prev_status == ST_DRAFT_CREATING and new_draft_http_ts > prev_draft_http_ts:
                 drafts_done += 1
+            if prev_status == ST_SUPPLY_CREATING and new_supply_http_ts > prev_supply_http_ts:
+                supplies_done += 1
 
-            if prev_status == ST_DRAFT_CREATING:
-                if new_status != ST_DRAFT_CREATING or draft_http_called or (prev_creating and not bool(tnow.get("creating"))):
-                    drafts_done += 1
+        next_delay: Optional[float] = None
+        n = now_ts()
+        for t in list_tasks():
+            if str(t.get("status") or "") == UI_STATUS_CREATED:
+                continue
+            nt = int(t.get("next_attempt_ts") or 0)
+            if nt and nt > n:
+                d = nt - n + float(t.get("retry_after_jitter") or 0.0)
+                if d > 0:
+                    next_delay = d if next_delay is None else min(next_delay, d)
 
-            if prev_status == ST_SUPPLY_CREATING:
-                if new_status != ST_SUPPLY_CREATING or (prev_creating and not bool(tnow.get("creating"))):
-                    supplies_done += 1
+        if next_delay is None and list_tasks():
+            next_delay = 15.0
 
-            if drafts_done >= SUPPLY_MAX_DRAFTS_PER_TICK and supplies_done >= SUPPLY_MAX_SUPPLY_CREATES_PER_TICK:
-                logging.info("Reached per-tick quotas; stop this tick")
-                break
+        if next_delay is not None:
+            logging.info("process_tasks: schedule next wakeup in %.2fs", next_delay)
+            _schedule_self_wakeup(float(next_delay), notify_text, notify_file)
 
         try:
-            n = now_ts()
-            threshold = max(1, int(SELF_WAKEUP_THRESHOLD_SECONDS))
-            soon: Optional[float] = None
-            for t in list_tasks():
-                nt = int(t.get("next_attempt_ts") or 0)
-                if nt and nt > n:
-                    d = nt - n
-                    if d <= threshold:
-                        jit = float(t.get("retry_after_jitter") or 0.0)
-                        candidate = max(0.05, d + jit)
-                        soon = candidate if soon is None else min(soon, candidate)
-            if soon is not None and soon > 0:
-                _schedule_self_wakeup(soon, notify_text, notify_file)
+            if random.random() < 0.1:
+                purge_tasks(SUPPLY_PURGE_AGE_DAYS)
         except Exception:
-            logging.exception("process_tasks: self-wakeup scheduling failed")
-    logging.info("process_tasks: END")
+            logging.exception("purge_tasks error")
+
+    logging.info("process_tasks: END (drafts=%d supplies=%d active=%d)", drafts_done, supplies_done, len(list_tasks()))
+
+def register_supply_scheduler(
+    scheduler: Any,
+    notify_text: Callable[[int, str], Awaitable[None]],
+    notify_file: Callable[[int, str, Optional[str]], Awaitable[None]],
+    interval_seconds: int = 15,
+):
+    async def _tick():
+        try:
+            await process_tasks(notify_text, notify_file)
+        except Exception:
+            logging.exception("register_supply_scheduler: tick failed")
+
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(_tick())
+    except RuntimeError:
+        pass
+
+    try:
+        if scheduler and hasattr(scheduler, "add_job"):
+            try:
+                scheduler.add_job(
+                    _tick,
+                    "interval",
+                    seconds=max(5, int(interval_seconds)),
+                    id=_SCHEDULER_JOB_ID,
+                    replace_existing=True,
+                    coalesce=True,
+                    max_instances=1,
+                )
+                scheduler.add_job(
+                    _tick,
+                    "date",
+                    run_date=datetime.utcnow() + timedelta(seconds=1),
+                    id=f"{_SCHEDULER_JOB_ID}_boot",
+                    replace_existing=True,
+                )
+                logging.info("register_supply_scheduler: APScheduler jobs registered (interval=%ss)", interval_seconds)
+                return
+            except Exception:
+                logging.exception("register_supply_scheduler: scheduler.add_job failed, fallback to self-wakeup")
+    except Exception:
+        logging.exception("register_supply_scheduler: scheduler probing failed, fallback")
+
+    try:
+        _schedule_self_wakeup(5.0, notify_text, notify_file)
+        logging.info("register_supply_scheduler: internal self-wakeup armed")
+    except Exception:
+        logging.exception("register_supply_scheduler: self-wakeup scheduling failed")
+
+async def close_http_client():
+    global _HTTP_CLIENT
+    if _HTTP_CLIENT is not None:
+        try:
+            await _HTTP_CLIENT.aclose()
+        except Exception:
+            pass
+        _HTTP_CLIENT = None
+
+__all__ = [
+    "register_supply_scheduler",
+    "process_tasks",
+    "create_tasks_from_template",
+    "cancel_task",
+    "retry_task",
+    "delete_task",
+    "purge_all_supplies_now",
+    "list_tasks",
+    "list_all_tasks",
+    "purge_tasks",
+    "purge_all_tasks",
+    "purge_stale_nonfinal",
+]
