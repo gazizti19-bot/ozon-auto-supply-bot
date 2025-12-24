@@ -794,48 +794,20 @@ def _extract_supply_order_info(js: Dict[str, Any]) -> Tuple[Optional[str], Optio
 
 
 def _supply_order_get_sync(self: httpx.Client, base_url: str, headers: Optional[Dict[str, str]], order_id: int) -> Optional[Dict[str, Any]]:
-    endpoints = ["/v2/supply-order/get", "/v1/supply-order/get"]
-    payloads = [
-        {"order_ids": [int(order_id)]},
-        {"order_id": int(order_id)},
-        {"supply_order_ids": [int(order_id)]},
-        {"supply_order_id": int(order_id)},
-    ]
-    for ep in endpoints:
-        for pl in payloads:
-            try:
-                resp = _ORIG_SYNC_POST(self, base_url + ep, json=pl, headers=headers)
-                if resp.status_code == 200:
-                    logger.info("supply-order/get OK via %s payload=%s", ep, json.dumps(pl, ensure_ascii=False))
-                    return resp.json()
-                else:
-                    logger.warning("supply-order/get HTTP %s via %s payload=%s: %s",
-                                   resp.status_code, ep, pl, (resp.text or "")[:200])
-            except Exception as e:
-                logger.warning("supply-order/get error via %s payload=%s: %s", ep, pl, e)
+    """
+    DISABLED per requirements: non-public /v1|v2/supply-order/get endpoints removed.
+    Returns None to avoid breaking callers that expect optional return.
+    """
+    logger.warning("_supply_order_get_sync called but disabled (order_id=%s)", order_id)
     return None
 
 
 async def _supply_order_get_async(self: httpx.AsyncClient, base_url: str, headers: Optional[Dict[str, str]], order_id: int) -> Optional[Dict[str, Any]]:
-    endpoints = ["/v2/supply-order/get", "/v1/supply-order/get"]
-    payloads = [
-        {"order_ids": [int(order_id)]},
-        {"order_id": int(order_id)},
-        {"supply_order_ids": [int(order_id)]},
-        {"supply_order_id": int(order_id)},
-    ]
-    for ep in endpoints:
-        for pl in payloads:
-            try:
-                resp = await _ORIG_ASYNC_POST(self, base_url + ep, json=pl, headers=headers)
-                if resp.status_code == 200:
-                    logger.info("supply-order/get(async) OK via %s payload=%s", ep, json.dumps(pl, ensure_ascii=False))
-                    return resp.json()
-                else:
-                    logger.warning("supply-order/get(async) HTTP %s via %s payload=%s: %s",
-                                   resp.status_code, ep, pl, (resp.text or "")[:200])
-            except Exception as e:
-                logger.warning("supply-order/get(async) error via %s payload=%s: %s", ep, pl, e)
+    """
+    DISABLED per requirements: non-public /v1|v2/supply-order/get endpoints removed.
+    Returns None to avoid breaking callers that expect optional return.
+    """
+    logger.warning("_supply_order_get_async called but disabled (order_id=%s)", order_id)
     return None
 
 

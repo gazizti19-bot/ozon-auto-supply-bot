@@ -531,6 +531,19 @@ class SupplyWorker:
             return
         body = {"operation_id": op_id}
         ok, status, data, err, raw = await api.json_request("POST", "/v1/draft/supply/create/status", json=body)
+        
+        # Handle 429 rate limiting
+        if status == 429:
+            attempts = task.get("poll_supply_429_attempts", 0) + 1
+            task["poll_supply_429_attempts"] = attempts
+            wait = min(RATE_LIMIT_MAX_WAIT, RATE_LIMIT_BASE_WAIT * (2 ** (attempts - 1)))
+            task["status"] = ST_RATE_LIMIT
+            task["rate_limit_resume_at"] = now_ts() + int(wait)
+            task["last_error"] = f"429_poll_supply_retry_in_{int(wait)}s"
+            record_event(task, "POLL_SUPPLY_429", {"wait": int(wait), "attempts": attempts})
+            self._update_task(task)
+            return
+        
         if ok and isinstance(data, dict):
             st = data.get("status")
             if st in ("DraftSupplyCreateStatusSuccess", "SUCCESS"):
@@ -539,51 +552,48 @@ class SupplyWorker:
                 if oids:
                     task["order_id"] = oids[0]
                     task["status"] = SupplyStatus.SUPPLY_ORDER_FETCH.value
+                    task.pop("poll_supply_429_attempts", None)  # Reset counter on success
                     record_event(task, "SUPPLY_ORDER_ID", {"order_id": task["order_id"]})
                 else:
-                    set_failed(task, "supply_create_no_order_ids")
+                    # No order_ids yet - mark as ORDER_DATA_FILLING instead of failing
+                    task["status"] = "ORDER_DATA_FILLING"
+                    task["last_error"] = "supply_create_no_order_ids_yet"
+                    record_event(task, "ORDER_DATA_FILLING_NEEDED", {"reason": "no_order_ids"})
             elif st in ("IN_PROGRESS", "DraftSupplyCreateStatusInProgress"):
                 record_event(task, "SUPPLY_CREATE_PROGRESS", {"op": op_id})
             else:
                 set_failed(task, f"supply_create_status_unexpected:{st}")
         else:
-            set_failed(task, f"supply_create_status_error:{err or status}")
+            # Don't fail immediately on non-429 errors if we're still in progress state
+            if status in (404, 400):
+                task["last_error"] = f"supply_create_status_error:{err or status}_non_fatal"
+                record_event(task, "SUPPLY_CREATE_STATUS_ERROR", {"status": status, "error": err})
+            else:
+                set_failed(task, f"supply_create_status_error:{err or status}")
         self._update_task(task)
 
     async def _order_fetch(self, task: Dict[str, Any]):
-        api = self._api_factory()
+        # Removed /v2/supply-order/get call per requirements - rely on create/status result
+        # If order_id exists, we can proceed directly to cargo prep or wait for user action
         if not task.get("order_id"):
-            set_failed(task, "missing_order_id")
+            # No order_id yet - mark as needing data filling rather than failing
+            task["status"] = "ORDER_DATA_FILLING"
+            task["last_error"] = "order_id_not_available_yet"
+            record_event(task, "ORDER_DATA_FILLING_NEEDED", {"reason": "no_order_id"})
             self._update_task(task)
             return
-        body = {"supply_order_ids": [task["order_id"]]}
-        ok, status, data, err, raw = await api.json_request("POST", "/v2/supply-order/get", json=body)
-        if ok and isinstance(data, dict):
-            orders = data.get("orders") or []
-            if not orders:
-                task["last_error"] = "order_fetch_empty"
-                self._update_task(task)
-                return
-            ord0 = orders[0]
-            meta_ts = ((ord0.get("timeslot") or {}).get("value") or {}).get("timeslot") or {}
-            fr = meta_ts.get("from") or meta_ts.get("from_in_timezone")
-            to = meta_ts.get("to") or meta_ts.get("to_in_timezone")
-            if fr and to:
-                task["from_in_timezone"] = fr
-                task["to_in_timezone"] = to
-                task["order_timeslot_set_ok"] = True
-                task["status"] = SupplyStatus.CARGO_PREP.value
-                record_event(task, "ORDER_FETCH_WITH_SLOT", {})
-            else:
-                can_set = (ord0.get("timeslot") or {}).get("can_set")
-                if can_set and not task.get("order_timeslot_set_ok"):
-                    task["status"] = SupplyStatus.TIMESLOT_SETTING.value
-                    record_event(task, "ORDER_NEEDS_TIMESLOT", {})
-                else:
-                    task["status"] = SupplyStatus.CARGO_PREP.value
-                    record_event(task, "ORDER_FETCH_NO_SLOT", {})
+        
+        # Check if we have timeslot info from previous steps
+        if task.get("from_in_timezone") and task.get("to_in_timezone"):
+            task["order_timeslot_set_ok"] = True
+            task["status"] = SupplyStatus.CARGO_PREP.value
+            record_event(task, "ORDER_FETCH_WITH_SLOT", {"source": "cached"})
         else:
-            set_failed(task, f"order_fetch_error:{err or status}")
+            # No timeslot info available - check if we should try to set it
+            # Since we can't reliably get timeslot metadata without supply-order/get,
+            # proceed to cargo prep and let user complete in UI if needed
+            task["status"] = SupplyStatus.CARGO_PREP.value
+            record_event(task, "ORDER_FETCH_NO_SLOT", {"note": "proceed_without_slot_meta"})
         self._update_task(task)
 
     async def _cargo_prep(self, task: Dict[str, Any]):
