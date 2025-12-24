@@ -1700,22 +1700,23 @@ def build_tasks_list_text(tasks:List[Dict[str,Any]], chat_id:int)->str:
         qty=_sum_qty(t)
         date=t.get("date") or (t.get("desired_from_iso","")[:10] if t.get("desired_from_iso") else "-")
         slot=_human_window(t.get("timeslot") or "", t.get("desired_from_iso") or "", t.get("desired_to_iso") or "")
-        sku=_first_sku(t) or 0
+        sku=_first_sku(t)
         tid=t.get("id") or "-"
         wh=_task_warehouse_name(t)
         cd=_resolve_crossdock_name_warehouses(t, chat_id)
         # Resolve product name
-        if sku:
-            product_name = get_sku_name_local(int(sku))
+        if sku and sku > 0:
+            product_name = get_sku_name_local(sku)
             # If name is just "SKU {n}", try lazy fetch
             if product_name.startswith("SKU "):
-                product_name = get_or_fetch_sku_name_lazy(int(sku))
+                product_name = get_or_fetch_sku_name_lazy(sku)
+            sku_display = str(sku)
         else:
             product_name = "-"
-            sku = "-"
+            sku_display = "-"
         # Format: stage + date + time on first line; product + SKU + qty + ID on second; warehouse + crossdock on third
         lines.append(f"{i}) {em} {stage} | {date} {slot}")
-        lines.append(f"   §§B§§{html.escape(product_name)}§§EB§§ (SKU {sku}) | {qty} шт | ID {tid}")
+        lines.append(f"   §§B§§{html.escape(product_name)}§§EB§§ (SKU {sku_display}) | {qty} шт | ID {tid}")
         lines.append(f"   Склад поставки: §§B§§{html.escape(wh)}§§EB§§ | Кроссдок: §§B§§{html.escape(cd)}§§EB§§")
     return build_html(lines)
 
@@ -1877,15 +1878,23 @@ def build_task_detail_text(t:Dict[str,Any], chat_id:int)->str:
         lines.append("Позиции:")
         for i,it in enumerate(sl,1):
             sku=it.get("sku"); q=it.get("total_qty") or it.get("qty") or 0
-            if sku:
-                sname=get_sku_name_local(int(sku))
+            # Validate and convert SKU
+            try:
+                sku_int = int(sku) if sku else 0
+            except (ValueError, TypeError):
+                sku_int = 0
+            
+            if sku_int > 0:
+                sname=get_sku_name_local(sku_int)
                 # If name is just "SKU {n}", try lazy fetch
                 if sname.startswith("SKU "):
-                    sname = get_or_fetch_sku_name_lazy(int(sku))
+                    sname = get_or_fetch_sku_name_lazy(sku_int)
+                sku_display = str(sku_int)
             else:
                 sname = "-"
+                sku_display = "-"
             wname=it.get("warehouse_name") or "-"
-            lines.append(f"{i}. §§B§§{html.escape(sname)}§§EB§§ (SKU {sku}) — {q} шт | {html.escape(wname)}")
+            lines.append(f"{i}. §§B§§{html.escape(sname)}§§EB§§ (SKU {sku_display}) — {q} шт | {html.escape(wname)}")
         lines.append("")
     if t.get("last_error"):
         lines.append(f"Ошибка: {html.escape(t['last_error'])}")
