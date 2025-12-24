@@ -2520,24 +2520,8 @@ async def advance_task(task: Dict[str, Any], api: OzonApi, notify_text: Callable
 
             task["status"] = UI_STATUS_CREATED
             task["updated_ts"] = now_ts()
-                update_task(task)
-                return
-
-            else:
-                task["op_retries"] = int(task.get("op_retries") or 0) + 1
-                if task["op_retries"] > max(SUPPLY_MAX_OPERATION_RETRIES, ORDER_FILL_MAX_RETRIES):
-                    task["status"] = ST_FAILED
-                    task["last_error"] = str(err)
-                    update_task(task)
-                    try:
-                        await notify_text(task["chat_id"], f"🟥 [{short(task['id'])}] supply-order/get: {err}")
-                    except Exception:
-                        logging.exception("notify_text failed on supply-order/get")
-                    return
-
-            task["status"] = ST_ORDER_DATA_FILLING
             update_task(task)
-
+            
             fast_until = int(task.get("order_fast_poll_until_ts") or 0)
             if fast_until and now_ts() < fast_until and not task.get("supply_id"):
                 schedule(max(3, int(ORDER_FAST_POLL_SECONDS)))
