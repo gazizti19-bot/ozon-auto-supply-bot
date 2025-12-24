@@ -59,9 +59,7 @@ USE_CLUSTER_WIDS = _get_bool_env("USE_CLUSTER_WIDS", "OZON_USE_CLUSTER_WIDS", de
 DISABLE_TS_FALLBACK = _get_bool_env("DISABLE_TS_FALLBACK", "OZON_TIMESLOT_DISABLE_FALLBACK", default=True)
 
 # ВАЖНО: читаем оба ключа, приоритет у AUTO_BOOK. По умолчанию ВЫКЛЮЧЕНО.
-AUTO_BOOK = _get_bool_env("AUTO_BOOK", "OZON_AUTO_BOOK", default=True)
-AUTO_BOOK = True  # forced override
-print("FORCE_PATCH: AUTO_BOOK forced to True")
+AUTO_BOOK = _get_bool_env("AUTO_BOOK", "OZON_AUTO_BOOK", default=False)
 
 REQUIRE_SUPPLY_ID = _get_bool_env("REQUIRE_SUPPLY_ID", default=False)
 PROGRESS_TASK_ON_BOOK = _get_bool_env("PROGRESS_TASK_ON_BOOK", default=True)
