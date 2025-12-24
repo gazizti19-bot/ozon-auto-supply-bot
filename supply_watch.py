@@ -172,17 +172,22 @@ def update_task(*args, **kwargs) -> Dict[str, Any]:
     - update_task(payload_dict_with_id)
     
     Persists to SUPPLY_TASK_FILE and logs updates.
+    When updating with a full task dict, it replaces the entire task.
     """
     ensure_loaded()
     
     # Parse arguments
     payload: Dict[str, Any] = {}
     task_id: Optional[str] = None
+    replace_entire = False
     
     if args:
         if len(args) == 1 and isinstance(args[0], dict):
-            # update_task(payload_dict_with_id)
+            # update_task(payload_dict_with_id) - check if it's a full task
             payload.update(args[0])
+            # If it has an ID and looks like a full task (has created_ts), replace entire task
+            if "id" in payload and "created_ts" in payload:
+                replace_entire = True
         elif len(args) >= 2:
             # update_task(task_id, payload_dict) or update_task(task_id, **kwargs)
             task_id = str(args[0])
@@ -205,8 +210,19 @@ def update_task(*args, **kwargs) -> Dict[str, Any]:
     
     # Get or create task
     if task_id in _tasks:
-        task = _tasks[task_id]
-        task.update(payload)
+        if replace_entire:
+            # Replace entire task (for cleanup of removed fields)
+            task = {
+                "id": task_id,
+                "created_ts": _tasks[task_id].get("created_ts", now_ts()),
+                "updated_ts": now_ts(),
+            }
+            task.update(payload)
+            _tasks[task_id] = task
+        else:
+            # Merge updates
+            task = _tasks[task_id]
+            task.update(payload)
     else:
         task = {
             "id": task_id,
@@ -337,17 +353,23 @@ def check_rate_limit_resume(task: Dict[str, Any]) -> bool:
     """
     Check if task is in rate limit state and resume time has passed.
     Returns True if task should transition back to processing.
+    Modifies task in-place and persists.
     """
     if task.get("status") != ST_RATE_LIMIT:
         return False
     
     resume_at = task.get("rate_limit_resume_at", 0)
     if now_ts() >= resume_at:
-        # Resume processing
-        task["status"] = ST_ORDER_DATA_FILLING  # Safe default state
-        task.pop("rate_limit_resume_at", None)
-        task.pop("last_error", None)
+        # Resume processing - remove rate limit fields
+        if "rate_limit_resume_at" in task:
+            del task["rate_limit_resume_at"]
+        if "last_error" in task:
+            del task["last_error"]
+        
+        # Transition to safe default state
+        task["status"] = ST_ORDER_DATA_FILLING
         task["next_attempt_ts"] = now_ts()
+        
         update_task(task)
         log.info("Task %s resumed from rate limit", short(task.get("id", "")))
         return True
