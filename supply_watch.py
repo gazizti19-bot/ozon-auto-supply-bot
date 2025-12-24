@@ -1452,7 +1452,7 @@ def _canon_cargo_type(raw: Any) -> str:
 def _build_cargoes_v1_payload(task: Dict[str, Any]) -> Dict[str, Any]:
     supply_id_raw = task.get("supply_id")
     if not supply_id_raw:
-        raise RuntimeError("supply_id is missing; wait for /v2/supply-order/get -> orders.supplies.supply_id")
+        raise RuntimeError("supply_id is missing; cannot create cargoes payload")
     try:
         supply_id = int(str(supply_id_raw).strip())
     except Exception:
