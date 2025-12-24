@@ -1705,7 +1705,7 @@ def build_tasks_list_text(tasks:List[Dict[str,Any]], chat_id:int)->str:
         wh=_task_warehouse_name(t)
         cd=_resolve_crossdock_name_warehouses(t, chat_id)
         # Resolve product name
-        if sku and sku > 0:
+        if sku is not None and sku > 0:
             product_name = get_sku_name_local(sku)
             # If name is just "SKU {n}", try lazy fetch
             if product_name.startswith("SKU "):
