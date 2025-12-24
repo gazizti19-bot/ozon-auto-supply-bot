@@ -3267,18 +3267,18 @@ async def cb_back_menu(c:CallbackQuery):
     await c.answer()
 
 # ==== Analyze filters and actions ====
-def _build_filtered_deficit_text(flat:List[Dict[str,Any]], mode:str)->str:
+def _build_filtered_deficit_text(flat: List[Dict[str, Any]], mode: str) -> str:
     # mode: all | crit | mid
     if not flat:
         return build_html([f"{EMOJI_ANALYZE} Нет данных."])
     def pass_item(it):
-        cov=it.get("coverage", 0.0)
-        if mode=="crit":
-            return cov<0.5
-        if mode=="mid":
-            return 0.5<=cov<0.8
+        cov = it.get("coverage", 0.0)
+        if mode == "crit":
+            return cov < 0.5
+        if mode == "mid":
+            return 0.5 <= cov < 0.8
         return True
-    by_sku: Dict[int, List[Dict[str,Any]]] = {}
+    by_sku: Dict[int, List[Dict[str, Any]]] = {}
     for it in flat:
         if pass_item(it):
             by_sku.setdefault(int(it["sku"]), []).append(it)
@@ -3286,27 +3286,31 @@ def _build_filtered_deficit_text(flat:List[Dict[str,Any]], mode:str)->str:
         return build_html([f"{EMOJI_ANALYZE} Нет позиций для выбранного фильтра."])
     
     # Respect view_mode like generate_deficit_report does
-    view_mode=BOT_STATE.get("view_mode", DEFAULT_VIEW_MODE)
-    full=(view_mode=="FULL")
-    crit=mid=hi=0
+    view_mode = BOT_STATE.get("view_mode", DEFAULT_VIEW_MODE)
+    full = (view_mode == "FULL")
+    crit = mid = hi = 0
     
-    lines=[f"{EMOJI_ANALYZE} §§B§§Дефицит ({'все' if mode=='all' else ('критично' if mode=='crit' else '50–80%')})§§EB§§", LEGEND_TEXT, SEP_BOLD]
-    order=sorted(by_sku.keys(), key=lambda s: min(x["coverage"] for x in by_sku[s]))
+    lines = [f"{EMOJI_ANALYZE} §§B§§Дефицит ({'все' if mode == 'all' else ('критично' if mode == 'crit' else '50–80%')})§§EB§§", LEGEND_TEXT, SEP_BOLD]
+    order = sorted(by_sku.keys(), key=lambda s: min(x["coverage"] for x in by_sku[s]))
     for sku in order[:80]:
-        items=sorted(by_sku[sku], key=lambda x:x["coverage"])
-        name=items[0].get("name") or SKU_NAME_CACHE.get(sku, f"SKU {sku}")
-        worst=min(i["coverage"] for i in items)
-        head="🔥" if worst<0.25 else (EMOJI_WARN if worst<0.5 else "➤")
+        items = sorted(by_sku[sku], key=lambda x: x["coverage"])
+        name = items[0].get("name") or SKU_NAME_CACHE.get(sku, f"SKU {sku}")
+        worst = min(i["coverage"] for i in items)
+        head = "🔥" if worst < 0.25 else (EMOJI_WARN if worst < 0.5 else "➤")
         lines.append(f"{head} §§B§§{name} (SKU {sku})§§EB§§")
-        total_qty=sum(i["qty"] for i in items); total_need=sum(i["need"] for i in items)
+        total_qty = sum(i["qty"] for i in items)
+        total_need = sum(i["need"] for i in items)
         for it in items:
             bar, sev = coverage_bar(it["coverage"])
-            if it["coverage"]<0.5: crit+=1
-            elif it["coverage"]<0.8: mid+=1
-            else: hi+=1
-            hist="(история)" if it.get("history_used") else "(мин. порог)"
-            badge=need_pct_text(it["qty"], it["norm"], it["target"])
-            wh_b=bold(it['warehouse_name'])
+            if it["coverage"] < 0.5:
+                crit += 1
+            elif it["coverage"] < 0.8:
+                mid += 1
+            else:
+                hi += 1
+            hist = "(история)" if it.get("history_used") else "(мин. порог)"
+            badge = need_pct_text(it["qty"], it["norm"], it["target"])
+            wh_b = bold(it['warehouse_name'])
             if full:
                 lines.append(f"• {wh_b}: Остаток {it['qty']} / Норма {it['norm']} / Цель {it['target']} → +{it['need']}\n  {bar} {sev} {hist} · {badge}")
             else:
