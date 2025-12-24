@@ -317,9 +317,13 @@ def supply_create_status_wait(oz: OzonClient, operation_id: str, timeout_s: int 
 
 
 def supply_order_get(oz: OzonClient, order_id: int) -> Dict[str, Any]:
-    resp = oz.post("/v2/supply-order/get", {"order_id": int(order_id)})
-    resp.raise_for_status()
-    return resp.json()
+    """
+    DISABLED per requirements: non-public /v2/supply-order/get endpoint removed.
+    Returns empty dict to avoid breaking callers.
+    """
+    import logging
+    logging.getLogger(__name__).warning("supply_order_get called but disabled (order_id=%s)", order_id)
+    return {}
 
 
 # -----------------------

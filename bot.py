@@ -3284,19 +3284,37 @@ def _build_filtered_deficit_text(flat:List[Dict[str,Any]], mode:str)->str:
             by_sku.setdefault(int(it["sku"]), []).append(it)
     if not by_sku:
         return build_html([f"{EMOJI_ANALYZE} Нет позиций для выбранного фильтра."])
-    lines=[f"{EMOJI_ANALYZE} §§B§§Дефицит ({'все' if mode=='all' else ('критично' if mode=='crit' else '50–80%')})§§EB§§", LEGEND_TEXT, SEP_THIN]
+    
+    # Respect view_mode like generate_deficit_report does
+    view_mode=BOT_STATE.get("view_mode", DEFAULT_VIEW_MODE)
+    full=(view_mode=="FULL")
+    crit=mid=hi=0
+    
+    lines=[f"{EMOJI_ANALYZE} §§B§§Дефицит ({'все' if mode=='all' else ('критично' if mode=='crit' else '50–80%')})§§EB§§", LEGEND_TEXT, SEP_BOLD]
     order=sorted(by_sku.keys(), key=lambda s: min(x["coverage"] for x in by_sku[s]))
     for sku in order[:80]:
         items=sorted(by_sku[sku], key=lambda x:x["coverage"])
         name=items[0].get("name") or SKU_NAME_CACHE.get(sku, f"SKU {sku}")
-        lines.append(f"• <b>{html.escape(name)}</b> (SKU {sku})")
-        for it in items[:6]:
+        worst=min(i["coverage"] for i in items)
+        head="🔥" if worst<0.25 else (EMOJI_WARN if worst<0.5 else "➤")
+        lines.append(f"{head} §§B§§{name} (SKU {sku})§§EB§§")
+        total_qty=sum(i["qty"] for i in items); total_need=sum(i["need"] for i in items)
+        for it in items:
             bar, sev = coverage_bar(it["coverage"])
+            if it["coverage"]<0.5: crit+=1
+            elif it["coverage"]<0.8: mid+=1
+            else: hi+=1
+            hist="(история)" if it.get("history_used") else "(мин. порог)"
             badge=need_pct_text(it["qty"], it["norm"], it["target"])
-            lines.append(f"  {html.escape(it['warehouse_name'])}: +{it['need']} · {badge}")
-            lines.append(f"  {bar} {sev}")
+            wh_b=bold(it['warehouse_name'])
+            if full:
+                lines.append(f"• {wh_b}: Остаток {it['qty']} / Норма {it['norm']} / Цель {it['target']} → +{it['need']}\n  {bar} {sev} {hist} · {badge}")
+            else:
+                lines.append(f"• {wh_b}: Остаток {it['qty']} → +{it['need']}  {bar} · {badge}")
+        lines.append(f"  Σ Остаток={total_qty}, Потребность (до нормы)={total_need}")
         lines.append(SEP_THIN)
-    return "\n".join(lines)
+    lines.append(f"{EMOJI_TARGET} Итоги фильтра: строк={sum(len(by_sku[s]) for s in by_sku)} | <50%={crit} | 50–80%={mid} | ≥80%={hi} | режим={view_mode}")
+    return build_html(lines)
 
 @dp.callback_query(F.data.startswith("filter:"))
 async def cb_filter(c:CallbackQuery):
@@ -3316,10 +3334,12 @@ async def cb_filter(c:CallbackQuery):
         [InlineKeyboardButton(text=f"{EMOJI_REFRESH} Обновить",callback_data="action:reanalyze")],
         [InlineKeyboardButton(text="Автобронирование",callback_data="menu_autobook")],
     ])
+    # Delete old message to avoid edit_text length constraints, then send using send_long
     try:
-        await c.message.edit_text(text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
+        await c.message.delete()
     except Exception:
-        await send_safe_message(c.message.chat.id, text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
+        pass
+    await send_long(c.message.chat.id, text, kb=kb)
     await c.answer("Фильтр применён")
 
 @dp.callback_query(F.data=="action:reanalyze")
