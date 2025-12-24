@@ -1372,38 +1372,11 @@ def _extract_order_meta(js: Dict[str, Any]) -> Dict[str, Any]:
     return meta
 
 async def api_supply_order_get(api: OzonApi, order_id: str) -> Tuple[bool, Optional[str], Optional[str], Optional[str], int, Dict[str, Any]]:
-    try:
-        oid = int(str(order_id).strip())
-    except Exception:
-        oid = str(order_id).strip()
-    payloads_v2 = [{"order_ids": [oid]}, {"supply_order_ids": [oid]}, {"order_id": oid}, {"supply_order_id": oid}]
-    payloads_v1 = [{"order_id": oid}, {"supply_order_id": oid}]
-    last_err = None
-    last_status = 0
-
-    for pl in payloads_v2:
-        ok, data, err, status, headers = await api.post("/v2/supply-order/get", pl)
-        if status == 429:
-            ra = _parse_retry_after(headers)
-            return False, None, None, f"rate_limit:{min(RATE_LIMIT_MAX_ON429, max(ON429_SHORT_RETRY_SEC, ra))}", status, {}
-        if ok:
-            sid, num = _extract_supply_order_info_from_response(data)
-            meta = _extract_order_meta(data)
-            return True, sid, (num or ""), None, status, meta
-        last_err, last_status = f"supply_order_get_error:{err}|{data}", status
-
-    for pl in payloads_v1:
-        ok, data, err, status, headers = await api.post("/v1/supply-order/get", pl)
-        if status == 429:
-            ra = _parse_retry_after(headers)
-            return False, None, None, f"rate_limit:{min(RATE_LIMIT_MAX_ON429, max(ON429_SHORT_RETRY_SEC, ra))}", status, {}
-        if ok:
-            sid, num = _extract_supply_order_info_from_response(data)
-            meta = _extract_order_meta(data)
-            return True, sid, (num or ""), None, status, meta
-        last_err, last_status = f"supply_order_get_error:{err}|{data}", status
-
-    return False, None, None, (last_err or "supply_order_get_error:unknown"), (last_status or 400), {}
+    # DISABLED: This function calls non-public /v1|v2/supply-order/get endpoints
+    # Per requirements, avoid these APIs and use /v1/draft/supply/create/status instead
+    # Return empty result to avoid breaking callers
+    logger.warning("api_supply_order_get called but is disabled - using fallback")
+    return False, None, None, "api_disabled_use_supply_create_status", 404, {}
 
 async def api_supply_order_timeslot_set(
     api: OzonApi,
@@ -2496,91 +2469,45 @@ async def advance_task(task: Dict[str, Any], api: OzonApi, notify_text: Callable
             return
 
         if st in (ST_SUPPLY_ORDER_FETCH, ST_ORDER_DATA_FILLING):
+            # Removed: Calls to non-public /v1|v2/supply-order/get
+            # Instead: Use information already available from /v1/draft/supply/create/status
+            # and prompt user to complete order in UI if additional info is needed
             task.setdefault("supply_id_wait_started_ts", now_ts())
 
-            ok, supply_id, number, err, status, meta = await api_supply_order_get(api, task["order_id"])
-            if status == 429 or (err and str(err or "").startswith("rate_limit:")):
-                attempts = int(task.get("order_get_rl_attempts") or 0) + 1
-                task["order_get_rl_attempts"] = attempts
+            # Notify user to complete order in UI (once only)
+            if not task.get("cargo_prep_prompted"):
+                link_main = SELLER_PORTAL_URL
+                rng = _fmt_local_range_short(task.get("desired_from_iso") or task.get("slot_from"),
+                                             task.get("desired_to_iso") or task.get("slot_to"))
+                num = task.get("supply_order_number") or task.get("order_id") or "—"
+                wh_disp = warehouse_display(task)
+
+                msg = (
+                    "🟦 Заявка создана\n"
+                    f"• Номер: {num}\n"
+                    f"• Окно приёмки: {rng}\n"
+                    f"• Склад: {wh_disp}\n"
+                    f"• Личный кабинет: {link_main}\n\n"
+                    "Действия: откройте ЛК, укажите грузоместа и количество, затем сгенерируйте этикетки."
+                )
                 try:
-                    ra = int(str(err).split(":", 1)[1]) if err else ON429_SHORT_RETRY_SEC
+                    await notify_text(task["chat_id"], msg)
                 except Exception:
-                    ra = ON429_SHORT_RETRY_SEC
-                base = min(RATE_LIMIT_MAX_ON429, max(ON429_SHORT_RETRY_SEC, ra))
-                wait_sec = min(45, base + attempts * 2)
-                _set_retry_after(task, wait_sec, jitter_max=1.5)
-                task["last_error"] = "429 Too Many Requests (supply-order/get)"
-                update_task(task)
-                schedule(wait_sec + 1)
-                return
-            if task.get("order_get_rl_attempts"):
-                task.pop("order_get_rl_attempts", None)
+                    logging.exception("notify_text failed on ORDER_DATA_FILLING prompt")
 
-            if ok:
-                task["supply_order_number"] = number or task.get("supply_order_number") or ""
-                if meta.get("dropoff_warehouse_id"):
-                    task["dropoff_warehouse_id"] = int(meta["dropoff_warehouse_id"])
-                    update_task(task)
-                if supply_id and not task.get("supply_id"):
-                    task["supply_id"] = str(supply_id)
-                    task["supply_id_verified"] = True
-                    update_task(task)
+                task["cargo_prep_prompted"] = True
+                task["created_message_ts"] = now_ts()
+                task["autodelete_ts"] = now_ts() + int(AUTO_DELETE_CREATED_MINUTES) * 60
 
-                await _auto_fill_timeslot_if_needed(task, api, meta, notify_text)
-
-                if not task.get("cargo_prep_prompted"):
-                    link_main = SELLER_PORTAL_URL
-                    rng = _fmt_local_range_short(task.get("desired_from_iso") or task.get("slot_from"),
-                                                 task.get("desired_to_iso") or task.get("slot_to"))
-                    num = task.get("supply_order_number") or "—"
-                    wh_disp = warehouse_display(task)
-
-                    msg = (
-                        "🟦 Заявка создана\n"
-                        f"• Номер: {num}\n"
-                        f"• Окно приёмки: {rng}\n"
-                        f"• Склад: {wh_disp}\n"
-                        f"• Личный кабинет: {link_main}\n\n"
-                        "Действия: откройте ЛК, укажите грузоместа и количество, затем сгенерируйте этикетки."
-                    )
-                    try:
-                        await notify_text(task["chat_id"], msg)
-                    except Exception:
-                        logging.exception("notify_text failed on ORDER_DATA_FILLING prompt")
-
-                    task["cargo_prep_prompted"] = True
-                    task["created_message_ts"] = now_ts()
-                    task["autodelete_ts"] = now_ts() + int(AUTO_DELETE_CREATED_MINUTES) * 60
-
-                if AUTO_DELETE_CREATED_IMMEDIATE:
-                    delete_task(task["id"])
-                    return
-
-                task["status"] = UI_STATUS_CREATED
-                task["updated_ts"] = now_ts()
-                update_task(task)
+            # Auto-delete if enabled, otherwise keep in CREATED state
+            if AUTO_DELETE_CREATED_IMMEDIATE:
+                delete_task(task["id"])
                 return
 
-            else:
-                task["op_retries"] = int(task.get("op_retries") or 0) + 1
-                if task["op_retries"] > max(SUPPLY_MAX_OPERATION_RETRIES, ORDER_FILL_MAX_RETRIES):
-                    task["status"] = ST_FAILED
-                    task["last_error"] = str(err)
-                    update_task(task)
-                    try:
-                        await notify_text(task["chat_id"], f"🟥 [{short(task['id'])}] supply-order/get: {err}")
-                    except Exception:
-                        logging.exception("notify_text failed on supply-order/get")
-                    return
-
-            task["status"] = ST_ORDER_DATA_FILLING
+            # Set status to CREATED (not FAILED) - this is a valid final state
+            task["status"] = UI_STATUS_CREATED
+            task["updated_ts"] = now_ts()
             update_task(task)
-
-            fast_until = int(task.get("order_fast_poll_until_ts") or 0)
-            if fast_until and now_ts() < fast_until and not task.get("supply_id"):
-                schedule(max(3, int(ORDER_FAST_POLL_SECONDS)))
-            else:
-                schedule(max(5, int(ORDER_FILL_POLL_INTERVAL_SECONDS)))
             return
 
     except Exception as e:
