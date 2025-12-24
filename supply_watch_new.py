@@ -49,14 +49,8 @@ def _getenv_bool(name: str, default: bool) -> bool:
 # ================== Paths / ENV ==================
 
 DATA_DIR = Path(_getenv_str("DATA_DIR", "/app/data")).resolve()
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 SUPPLY_TASK_FILE = DATA_DIR / _getenv_str("SUPPLY_TASK_FILE", "supply_tasks.json")
-
-def _ensure_data_dir():
-    """Ensure data directory exists, create if needed"""
-    try:
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-    except (PermissionError, FileNotFoundError) as e:
-        log.warning("Could not create DATA_DIR %s: %s", DATA_DIR, e)
 
 # ================== Constants ==================
 
@@ -113,9 +107,6 @@ def ensure_loaded():
     global _tasks_loaded, _tasks
     if _tasks_loaded:
         return
-    
-    _ensure_data_dir()
-    
     if SUPPLY_TASK_FILE.exists():
         try:
             data = json.loads(SUPPLY_TASK_FILE.read_text(encoding="utf-8"))
@@ -136,7 +127,6 @@ def ensure_loaded():
 def save_tasks():
     """Save tasks to persistence file atomically"""
     try:
-        _ensure_data_dir()
         SUPPLY_TASK_FILE.parent.mkdir(parents=True, exist_ok=True)
         # Convert dict to list for compatibility
         task_list = list(_tasks.values())
