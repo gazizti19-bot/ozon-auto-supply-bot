@@ -14,3 +14,15 @@ _book
 *.epub
 *.mobi
 *.pdf
+
+# Python rules:
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info
+dist
+build

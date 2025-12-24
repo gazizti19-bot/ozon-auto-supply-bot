@@ -400,8 +400,8 @@ SEP_THIN="─"*60
 SEP_BOLD="═"*60
 
 EMOJI_OK="✅"; EMOJI_WARN="⚠"; EMOJI_ANALYZE="🔍"; EMOJI_NOTIFY="📣"; EMOJI_BOX="📦"
-EMOJI_WH="🏬"; EMOJI_CLUSTER="🗺"; EMОJI_REFRESH="🔄"; EMOJI_REFRESH="🔄"; EMОJI_TARGET="🎯"; EMOJI_TARGET="🎯"
-EMOJI_INFO="ℹ"; EMOJI_DIAG="🧪"; EMOJI_AI="🤖"; EMОJI_CLOUD="☁"; EMOJI_CLOUD="☁"
+EMOJI_WH="🏬"; EMOJI_CLUSTER="🗺"; EMOJI_REFRESH="🔄"; EMOJI_TARGET="🎯"
+EMOJI_INFO="ℹ"; EMOJI_DIAG="🧪"; EMOJI_AI="🤖"; EMOJI_CLOUD="☁"
 EMOJI_CHAT="💬"; EMOJI_LIST="📄"; EMOJI_TASKS="📋"
 
 LEGEND_TEXT="Легенда: 🟥 <25%  🟧 <50%  🟨 <80%  🟩 ≥80%"
@@ -1475,12 +1475,8 @@ def resolve_abf_stage_emoji_map()->Dict[str,str]:
         pass
     return DEFAULT_STAGE_EMOJI_RU
 
-# Основная карта и безопасный алиас (с кириллической 'О')
+# Основная карта эмодзи стадий
 STAGE_EMOJI_RU = resolve_abf_stage_emoji_map()
-try:
-    STAGE_EMОJI_RU = STAGE_EMOJI_RU  # алиас с кириллической 'О'
-except Exception:
-    pass
 
 def classify_task_stage(task:Dict[str,Any])->Tuple[str,str]:
     """
@@ -1509,21 +1505,21 @@ def classify_task_stage(task:Dict[str,Any])->Tuple[str,str]:
         return (STAGE_EMOJI_RU.get("Слот","🕘"),"Слот")
     # Ожидание supply
     if "SUPPLY_ORDER_FETCH" in status or "POLL_SUPPLY" in status:
-        return (STAGE_EMОJI_RU.get("Ожидание supply","🔄") if 'STAGE_EMОJI_RU' in globals() else STAGE_EMOJI_RU.get("Ожидание supply","🔄"),"Ожидание supply")
+        return (STAGE_EMOJI_RU.get("Ожидание supply","🔄"),"Ожидание supply")
     # Черновики/ожидания
     if status in DRAFT_STATUSES:
         if desired_from_iso and status=="WAIT_WINDOW":
             return (STAGE_EMOJI_RU.get("Ожидание","⏳"),"Ожидание")
-        return (STAGE_EMОJI_RU.get("Черновик","📝") if 'STAGE_EMОJI_RU' in globals() else STAGE_EMOJI_RU.get("Черновик","📝"),"Черновик")
+        return (STAGE_EMOJI_RU.get("Черновик","📝"),"Черновик")
     if status in WAIT_STATUSES or status.startswith("WAIT_"):
-        return (STAGE_EMОJI_RU.get("Ожидание","⏳"),"Ожидание")
+        return (STAGE_EMOJI_RU.get("Ожидание","⏳"),"Ожидание")
 
     # Ошибка — обрабатываем после финальных стадий
     if status in ERROR_STATUSES or last_error:
-        return (STAGE_EMОJI_RU.get("Ошибка","❌"),"Ошибка")
+        return (STAGE_EMOJI_RU.get("Ошибка","❌"),"Ошибка")
 
     # По умолчанию — черновик
-    return (STAGE_EMОJI_RU.get("Черновик","📝") if 'STAGE_EMОJI_RU' in globals() else STAGE_EMOJI_RU.get("Черновик","📝"),"Черновик")
+    return (STAGE_EMOJI_RU.get("Черновик","📝"),"Черновик")
 
 def _first_time_or_dash(task:Dict[str,Any])->str:
     ts=task.get("timeslot") or ""
@@ -1692,6 +1688,10 @@ def _application_status_text(status:str)->str:
 
 # ==== Lists renderers (Tasks/Applications) ====
 def build_tasks_list_text(tasks:List[Dict[str,Any]], chat_id:int)->str:
+    """
+    Build tasks list with full product names (resolved from SKU) and improved formatting.
+    Shows: stage emoji + stage + date + time window; product name + SKU + qty + ID; warehouse + crossdock.
+    """
     if not tasks:
         return build_html(["§§B§§📋 Активные задачи (0)§§EB§§",SEP_THIN,"Сейчас нет активных (незавершённых) задач."])
     lines=[f"§§B§§📋 Активные задачи ({len(tasks)})§§EB§§",SEP_THIN]
@@ -1700,24 +1700,48 @@ def build_tasks_list_text(tasks:List[Dict[str,Any]], chat_id:int)->str:
         qty=_sum_qty(t)
         date=t.get("date") or (t.get("desired_from_iso","")[:10] if t.get("desired_from_iso") else "-")
         slot=_human_window(t.get("timeslot") or "", t.get("desired_from_iso") or "", t.get("desired_to_iso") or "")
-        sku=_first_sku(t) or "-"
+        sku=_first_sku(t)
         tid=t.get("id") or "-"
         wh=_task_warehouse_name(t)
         cd=_resolve_crossdock_name_warehouses(t, chat_id)
-        lines.append(f"{i}) {em} {stage} | {qty} шт | {date} {slot} | SKU {sku} | {tid}")
+        # Resolve product name
+        if sku is not None and sku > 0:
+            product_name = get_sku_name_local(sku)
+            # If name is just "SKU {n}", try lazy fetch
+            if product_name.startswith("SKU "):
+                product_name = get_or_fetch_sku_name_lazy(sku)
+            sku_display = str(sku)
+        else:
+            product_name = "-"
+            sku_display = "-"
+        # Format: stage + date + time on first line; product + SKU + qty + ID on second; warehouse + crossdock on third
+        lines.append(f"{i}) {em} {stage} | {date} {slot}")
+        lines.append(f"   §§B§§{html.escape(product_name)}§§EB§§ (SKU {sku_display}) | {qty} шт | ID {tid}")
         lines.append(f"   Склад поставки: §§B§§{html.escape(wh)}§§EB§§ | Кроссдок: §§B§§{html.escape(cd)}§§EB§§")
     return build_html(lines)
 
 def _last_created_tasks(limit:int=3)->List[Dict[str,Any]]:
+    """
+    Scan SUPPLY_EVENTS["*"] in reverse chronological order and collect unique applications.
+    Treats as "created": CREATED, DONE, SUCCESS, FINISHED, COMPLETED, SUPPLY_CREATED, 
+    ORDER_DATA_FILLING, and textual mentions like "создан".
+    """
     arr=SUPPLY_EVENTS.get("*") or []
     created=[]
+    seen=set()
     for e in reversed(arr):
+        payload=e.get("payload") or {}
+        tid=payload.get("id") or payload.get("task_id") or ""
+        if not tid or tid in seen:
+            continue
         txt=(e.get("text") or "").lower()
         st=(e.get("status") or "").lower()
-        payload=e.get("payload") or {}
-        if "создан" in txt or st in ("created","done","success","finished","completed","supply_created","supply created"):
+        # Treat as created: explicit states + ORDER_DATA_FILLING + textual mentions
+        if "создан" in txt or st in ("created","done","success","finished","completed","supply_created","supply created","order_data_filling"):
+            seen.add(tid)
             created.append(payload)
-            if len(created)>=limit: break
+            if len(created)>=limit:
+                break
     return created
 
 def build_last_created_tasks_text(limit:int=3)->str:
@@ -1854,9 +1878,23 @@ def build_task_detail_text(t:Dict[str,Any], chat_id:int)->str:
         lines.append("Позиции:")
         for i,it in enumerate(sl,1):
             sku=it.get("sku"); q=it.get("total_qty") or it.get("qty") or 0
-            sname=get_sku_name_local(int(sku)) if sku else "-"
+            # Validate and convert SKU
+            try:
+                sku_int = int(sku) if sku else 0
+            except (ValueError, TypeError):
+                sku_int = 0
+            
+            if sku_int > 0:
+                sname=get_sku_name_local(sku_int)
+                # If name is just "SKU {n}", try lazy fetch
+                if sname.startswith("SKU "):
+                    sname = get_or_fetch_sku_name_lazy(sku_int)
+                sku_display = str(sku_int)
+            else:
+                sname = "-"
+                sku_display = "-"
             wname=it.get("warehouse_name") or "-"
-            lines.append(f"{i}. §§B§§{html.escape(sname)}§§EB§§ (SKU {sku}) — {q} шт | {html.escape(wname)}")
+            lines.append(f"{i}. §§B§§{html.escape(sname)}§§EB§§ (SKU {sku_display}) — {q} шт | {html.escape(wname)}")
         lines.append("")
     if t.get("last_error"):
         lines.append(f"Ошибка: {html.escape(t['last_error'])}")
@@ -1905,22 +1943,42 @@ async def delete_task_by_id(tid:str) -> bool:
     return False
 
 def _remove_task_from_caches(chat_id:int, tid:str):
+    """
+    Remove task from caches. Preserves application events (created/done states) 
+    to keep last 3 created applications visible.
+    """
     # Удаляем из TASKS_CACHE
     lst = TASKS_CACHE.get(chat_id) or []
     TASKS_CACHE[chat_id] = [t for t in lst if str(t.get("id") or "") != str(tid)]
-    # Удаляем события SUPPLY_EVENTS для этого tid
+    # Удаляем только события задач (не заявок) из SUPPLY_EVENTS
     try:
         for key in list(SUPPLY_EVENTS.keys()):
             events = SUPPLY_EVENTS.get(key) or []
-            SUPPLY_EVENTS[key] = [
-                e for e in events
-                if str(((e.get("payload") or {}).get("id") or (e.get("payload") or {}).get("task_id") or "")) != str(tid)
-            ]
+            filtered = []
+            for e in events:
+                payload = e.get("payload") or {}
+                event_tid = str(payload.get("id") or payload.get("task_id") or "")
+                if event_tid != str(tid):
+                    # Не этот task - сохраняем
+                    filtered.append(e)
+                else:
+                    # Это событие для данного task - проверяем, заявка ли это
+                    text = (e.get("text") or "").lower()
+                    status = (e.get("status") or "").lower()
+                    # Сохраняем события о созданных заявках
+                    if "создан" in text or status in ("создано","created","done","success","finished","completed","supply_created","order_data_filling"):
+                        filtered.append(e)
+                    # Иначе удаляем (это событие обычной задачи)
+            SUPPLY_EVENTS[key] = filtered
         _persist_supply_events()
     except Exception as e:
         log.warning("SUPPLY_EVENTS purge for %s failed: %s", tid, e)
 
 async def delete_all_tasks_for_chat(chat_id:int) -> int:
+    """
+    Delete all tasks for a chat. Applications data (SUPPLY_EVENTS, APPS_CACHE, NOTIFIED_CREATED) 
+    is preserved so the last 3 created applications remain visible.
+    """
     lst = TASKS_CACHE.get(chat_id) or []
     count = 0
     # Если доступно purge_all_tasks — используем
@@ -1931,13 +1989,7 @@ async def delete_all_tasks_for_chat(chat_id:int) -> int:
                 await res
             count = len(lst)
             TASKS_CACHE[chat_id] = []
-            # чистим события
-            try:
-                for key in list(SUPPLY_EVENTS.keys()):
-                    SUPPLY_EVENTS[key] = []
-                _persist_supply_events()
-            except Exception:
-                pass
+            # НЕ чистим SUPPLY_EVENTS, APPS_CACHE, NOTIFIED_CREATED — сохраняем заявки
             return count
     except Exception as e:
         log.warning("purge_all_tasks failed: %s", e)
@@ -2117,6 +2169,40 @@ async def scan_and_notify_created(chat_id:int, tasks:List[Dict[str,Any]]):
         save_state()
 
 # ==== Analyze / snapshot / daily notify ====
+async def _ensure_deficit_cache_for_chat(chat_id: int) -> Dict[str, Any]:
+    """
+    Ensure LAST_DEFICIT_CACHE has valid data for the given chat.
+    If missing, performs a fast recomputation and stores the result.
+    Returns the cache dict with keys: flat, timestamp, report, raw_rows, consumption_cache.
+    """
+    cache = LAST_DEFICIT_CACHE.get(chat_id)
+    if cache and cache.get("flat"):
+        return cache
+    
+    # Cache missing or empty - recompute
+    log.info("Deficit cache missing for chat %s, recomputing...", chat_id)
+    try:
+        await ensure_sku_names(force=True)
+        rows, err = await ozon_stock_fbo(SKU_LIST)
+        if err:
+            log.warning("Failed to fetch stock for deficit cache: %s", err)
+            return {}
+        ccache = build_consumption_cache()
+        report, flat = generate_deficit_report(rows, SKU_NAME_CACHE, ccache)
+        cache = {
+            "flat": flat,
+            "timestamp": int(time.time()),
+            "report": report,
+            "raw_rows": rows,
+            "consumption_cache": ccache
+        }
+        LAST_DEFICIT_CACHE[chat_id] = cache
+        log.info("Deficit cache recomputed for chat %s: %d items", chat_id, len(flat))
+        return cache
+    except Exception as e:
+        log.exception("Failed to ensure deficit cache for chat %s: %s", chat_id, e)
+        return {}
+
 async def handle_analyze(chat_id:int, verbose:bool=True):
     global LAST_ANALYZE_MS,LAST_ANALYZE_ERROR
     async with ANALYZE_LOCK:
@@ -2441,6 +2527,10 @@ def build_diag_report()->str:
     return build_html(lines)
 
 def build_supplies_last_created(limit:int=3)->str:
+    """
+    Build text for last created applications. Shows last 3 created entries with both 
+    sides (warehouse + crossdock) and explicit status labels.
+    """
     arr=SUPPLY_EVENTS.get("*") or []
     try:
         loop=asyncio.get_running_loop()
@@ -2457,7 +2547,8 @@ def build_supplies_last_created(limit:int=3)->str:
         if not tid or tid in seen: continue
         text=(e.get("text") or "")
         status=(e.get("status") or "")
-        if "создан" in text.lower() or status.lower() in ("создано","created","done","success","finished","completed","supply_created"):
+        # Include ORDER_DATA_FILLING as created state
+        if "создан" in text.lower() or status.lower() in ("создано","created","done","success","finished","completed","supply_created","order_data_filling"):
             seen.add(tid); created.append(e)
             if len(created)>=limit: break
     if not created:
@@ -2471,8 +2562,14 @@ def build_supplies_last_created(limit:int=3)->str:
         wh=payload.get("warehouse_name") or payload.get("drop_off_name") or "-"
         cd=payload.get("crossdock_name") or payload.get("crossdock_id") or ""
         slot=_human_window(payload.get("timeslot") or "", payload.get("desired_from_iso") or "", payload.get("desired_to_iso") or "")
+        # Determine status label
+        status_text = (e.get("status") or "").lower()
+        if status_text in ("done", "success", "finished", "completed"):
+            status_label = "Статус: ✅ Готово"
+        else:
+            status_label = "Статус: ✅ Создано"
         lines.append(f"ID: §§B§§{tid}§§EB§§ | §§B§§{qty} шт§§EB§§ | Окно: {html.escape(slot)}")
-        lines.append(f"Статус: ✅ Создано")
+        lines.append(status_label)
         lines.append(f"Склад поставки: §§B§§{html.escape(wh)}§§EB§§ | Кроссдок: §§B§§{html.escape(cd)}§§EB§§")
         if sku_list:
             lines.append("Позиции:")
@@ -3203,15 +3300,14 @@ def _build_filtered_deficit_text(flat:List[Dict[str,Any]], mode:str)->str:
 
 @dp.callback_query(F.data.startswith("filter:"))
 async def cb_filter(c:CallbackQuery):
+    """
+    Filter handler for Analysis view. Uses cache or triggers recomputation if missing.
+    """
     ensure_admin(c.from_user.id)
     mode=c.data.split(":",1)[1]
-    cache=LAST_DEFICIT_CACHE.get(c.message.chat.id) or {}
-    flat=cache.get("flat") or []
-    # Фолбэк: если кэша нет — пересчитываем срочно и повторяем
-    if not flat:
-        await handle_analyze(c.message.chat.id, verbose=False)
-        cache=LAST_DEFICIT_CACHE.get(c.message.chat.id) or {}
-        flat=cache.get("flat") or []
+    # Ensure cache exists, recompute if necessary
+    cache = await _ensure_deficit_cache_for_chat(c.message.chat.id)
+    flat = cache.get("flat") or []
     text=_build_filtered_deficit_text(flat, mode)
     kb=InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Все",callback_data="filter:all"),
