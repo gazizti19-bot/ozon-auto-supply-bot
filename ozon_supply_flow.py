@@ -317,10 +317,9 @@ def supply_create_status_wait(oz: OzonClient, operation_id: str, timeout_s: int 
 
 
 def supply_order_get(oz: OzonClient, order_id: int) -> Dict[str, Any]:
-    # DISABLED: Non-public API endpoint - per requirements, avoid /v2/supply-order/get
-    # Return empty dict to avoid breaking callers
-    logger.warning("supply_order_get called but is disabled - returning empty dict")
-    return {}
+    resp = oz.post("/v2/supply-order/get", {"order_id": int(order_id)})
+    resp.raise_for_status()
+    return resp.json()
 
 
 # -----------------------

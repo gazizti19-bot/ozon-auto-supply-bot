@@ -794,14 +794,48 @@ def _extract_supply_order_info(js: Dict[str, Any]) -> Tuple[Optional[str], Optio
 
 
 def _supply_order_get_sync(self: httpx.Client, base_url: str, headers: Optional[Dict[str, str]], order_id: int) -> Optional[Dict[str, Any]]:
-    # DISABLED: Non-public API endpoint - per requirements, avoid /v1|v2/supply-order/get
-    logger.warning("_supply_order_get_sync called but is disabled - returning None")
+    endpoints = ["/v2/supply-order/get", "/v1/supply-order/get"]
+    payloads = [
+        {"order_ids": [int(order_id)]},
+        {"order_id": int(order_id)},
+        {"supply_order_ids": [int(order_id)]},
+        {"supply_order_id": int(order_id)},
+    ]
+    for ep in endpoints:
+        for pl in payloads:
+            try:
+                resp = _ORIG_SYNC_POST(self, base_url + ep, json=pl, headers=headers)
+                if resp.status_code == 200:
+                    logger.info("supply-order/get OK via %s payload=%s", ep, json.dumps(pl, ensure_ascii=False))
+                    return resp.json()
+                else:
+                    logger.warning("supply-order/get HTTP %s via %s payload=%s: %s",
+                                   resp.status_code, ep, pl, (resp.text or "")[:200])
+            except Exception as e:
+                logger.warning("supply-order/get error via %s payload=%s: %s", ep, pl, e)
     return None
 
 
 async def _supply_order_get_async(self: httpx.AsyncClient, base_url: str, headers: Optional[Dict[str, str]], order_id: int) -> Optional[Dict[str, Any]]:
-    # DISABLED: Non-public API endpoint - per requirements, avoid /v1|v2/supply-order/get
-    logger.warning("_supply_order_get_async called but is disabled - returning None")
+    endpoints = ["/v2/supply-order/get", "/v1/supply-order/get"]
+    payloads = [
+        {"order_ids": [int(order_id)]},
+        {"order_id": int(order_id)},
+        {"supply_order_ids": [int(order_id)]},
+        {"supply_order_id": int(order_id)},
+    ]
+    for ep in endpoints:
+        for pl in payloads:
+            try:
+                resp = await _ORIG_ASYNC_POST(self, base_url + ep, json=pl, headers=headers)
+                if resp.status_code == 200:
+                    logger.info("supply-order/get(async) OK via %s payload=%s", ep, json.dumps(pl, ensure_ascii=False))
+                    return resp.json()
+                else:
+                    logger.warning("supply-order/get(async) HTTP %s via %s payload=%s: %s",
+                                   resp.status_code, ep, pl, (resp.text or "")[:200])
+            except Exception as e:
+                logger.warning("supply-order/get(async) error via %s payload=%s: %s", ep, pl, e)
     return None
 
 
@@ -1114,7 +1148,7 @@ def _maybe_autobook_supply_sync(self: httpx.Client, timeslot_url: str, req_js: D
         details = _supply_order_get_sync(self, base, headers, order_id) or {}
         num, sid = _extract_supply_order_info(details or {})
         if REQUIRE_SUPPLY_ID and sid is None:
-            logger.warning("supply_id is missing (supply-order/get API is disabled), but REQUIRE_SUPPLY_ID=true")
+            logger.warning("supply_id is missing in supply-order/get response, but REQUIRE_SUPPLY_ID=true")
         _persist_booking_result(draft_id, order_id, num, sid, f, t, supply_wid)
     else:
         _BOOKED_DRAFTS.add(draft_id)
@@ -1183,7 +1217,7 @@ async def _maybe_autobook_supply_async(self: httpx.AsyncClient, timeslot_url: st
         details = await _supply_order_get_async(self, base, headers, order_id) or {}
         num, sid = _extract_supply_order_info(details or {})
         if REQUIRE_SUPPLY_ID and sid is None:
-            logger.warning("supply_id is missing (supply-order/get API is disabled), but REQUIRE_SUPPLY_ID=true")
+            logger.warning("supply_id is missing in supply-order/get response, but REQUIRE_SUPPLY_ID=true")
         _persist_booking_result(draft_id, order_id, num, sid, f, t, supply_wid)
     else:
         _BOOKED_DRAFTS.add(draft_id)
