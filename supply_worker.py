@@ -531,6 +531,19 @@ class SupplyWorker:
             return
         body = {"operation_id": op_id}
         ok, status, data, err, raw = await api.json_request("POST", "/v1/draft/supply/create/status", json=body)
+        
+        # Handle 429 rate limit with exponential backoff
+        if status == 429:
+            attempts = task.get("poll_supply_429_attempts", 0) + 1
+            task["poll_supply_429_attempts"] = attempts
+            wait = min(60, 2 * (2 ** (attempts - 1)))
+            task["last_error"] = "rate_limit:429"
+            task["retry_after_ts"] = now_ts() + int(wait)
+            task["next_attempt_ts"] = task["retry_after_ts"]
+            record_event(task, "POLL_SUPPLY_429", {"wait": int(wait), "attempts": attempts})
+            self._update_task(task)
+            return
+        
         if ok and isinstance(data, dict):
             st = data.get("status")
             if st in ("DraftSupplyCreateStatusSuccess", "SUCCESS"):
@@ -539,15 +552,22 @@ class SupplyWorker:
                 if oids:
                     task["order_id"] = oids[0]
                     task["status"] = SupplyStatus.SUPPLY_ORDER_FETCH.value
+                    task.pop("poll_supply_429_attempts", None)  # Reset counter on success
                     record_event(task, "SUPPLY_ORDER_ID", {"order_id": task["order_id"]})
                 else:
                     set_failed(task, "supply_create_no_order_ids")
             elif st in ("IN_PROGRESS", "DraftSupplyCreateStatusInProgress"):
                 record_event(task, "SUPPLY_CREATE_PROGRESS", {"op": op_id})
             else:
-                set_failed(task, f"supply_create_status_unexpected:{st}")
+                # Treat unexpected statuses as non-fatal - keep in ORDER_DATA_FILLING
+                task["status"] = "ORDER_DATA_FILLING"
+                task["last_error"] = f"unexpected_status:{st}"
+                record_event(task, "SUPPLY_CREATE_STATUS_UNEXPECTED", {"status": st})
         else:
-            set_failed(task, f"supply_create_status_error:{err or status}")
+            # Treat HTTP errors as non-fatal - keep in ORDER_DATA_FILLING
+            task["status"] = "ORDER_DATA_FILLING"
+            task["last_error"] = f"http_error:{err or status}"
+            record_event(task, "SUPPLY_CREATE_HTTP_ERROR", {"err": str(err), "status": status})
         self._update_task(task)
 
     async def _order_fetch(self, task: Dict[str, Any]):
