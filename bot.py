@@ -3289,14 +3289,14 @@ def _build_filtered_deficit_text(flat:List[Dict[str,Any]], mode:str)->str:
     for sku in order[:80]:
         items=sorted(by_sku[sku], key=lambda x:x["coverage"])
         name=items[0].get("name") or SKU_NAME_CACHE.get(sku, f"SKU {sku}")
-        lines.append(f"• <b>{html.escape(name)}</b> (SKU {sku})")
+        lines.append(f"• §§B§§{name}§§EB§§ (SKU {sku})")
         for it in items[:6]:
             bar, sev = coverage_bar(it["coverage"])
             badge=need_pct_text(it["qty"], it["norm"], it["target"])
-            lines.append(f"  {html.escape(it['warehouse_name'])}: +{it['need']} · {badge}")
+            lines.append(f"  {it['warehouse_name']}: +{it['need']} · {badge}")
             lines.append(f"  {bar} {sev}")
         lines.append(SEP_THIN)
-    return "\n".join(lines)
+    return build_html(lines)
 
 @dp.callback_query(F.data.startswith("filter:"))
 async def cb_filter(c:CallbackQuery):
